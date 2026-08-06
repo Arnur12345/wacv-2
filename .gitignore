@@ -1,0 +1,13 @@
+# environment
+.venv/
+__pycache__/
+*.pyc
+
+# regenerable outputs
+figures/
+
+# imaging data -- large, and not ours to redistribute (LIDC-IDRI, CC BY 3.0)
+dicom/
+true_dicom_ct/
+1.3.6.1.4.1.*/
+*.dcm
