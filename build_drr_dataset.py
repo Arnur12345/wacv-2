@@ -324,6 +324,8 @@ def main(argv=None) -> int:
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) // 2))
     ap.add_argument("--limit", type=int, default=0, help="first N series only")
     ap.add_argument("--force", action="store_true", help="ignore existing output")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="discovery only: what pairs, what does not, and why")
     args = ap.parse_args(argv)
 
     os.makedirs(os.path.join(args.out, "images"), exist_ok=True)
@@ -338,9 +340,36 @@ def main(argv=None) -> int:
     annotated = [s for s in series if s.xml]
     print(f"  {len(series)} CT series, {len(xmls)} annotation XMLs, "
           f"{len(annotated)} paired ({time.time() - t0:.0f}s)")
-    if not annotated:
-        print("nothing to do: no CT series has a matching SeriesInstanceUid in any XML")
-        return 1
+
+    if args.dry_run or not annotated:
+        patients = {s.patient_id for s in series}
+        pat_ann = {s.patient_id for s in annotated}
+        print(f"\n  patients: {len(patients)} total, {len(pat_ann)} with annotations")
+        unpaired = [s for s in series if not s.xml]
+        if unpaired:
+            print(f"\n  {len(unpaired)} CT series with no matching XML, e.g.:")
+            for s in unpaired[:3]:
+                print(f"    {s.patient_id}  {s.n_files} slices  {s.ct_dir}")
+        orphan = set(xmls) - {s.series_uid for s in series}
+        if orphan:
+            print(f"\n  {len(orphan)} XML(s) whose series is not on disk")
+        if annotated:
+            secs = len(annotated) * (len(args.views) * 3.0 + 2.0) / max(1, args.workers)
+            print(f"\n  would process {len(annotated)} series on {args.workers} worker(s)"
+                  f"  ~{secs / 60:.0f} min")
+            for s in annotated[:3]:
+                print(f"    {s.patient_id}  {s.n_files} slices  <- {os.path.basename(s.xml)}")
+        else:
+            print("\n  NOTHING WILL BE PRODUCED: no CT series has a matching "
+                  "SeriesInstanceUid in any XML.")
+            print("  The TCIA image download does not include the radiologist "
+                  "annotations; they are a separate\n  'LIDC-XML-only.zip' on the "
+                  "collection page. Unzip it anywhere under --root (or pass its\n"
+                  "  parent as --root) and re-run: pairing is by SeriesInstanceUid, "
+                  "not by path.")
+            return 1
+        if args.dry_run:
+            return 0
 
     man_path = os.path.join(args.out, "manifest.jsonl")
     skip_path = os.path.join(args.out, "skipped.jsonl")
