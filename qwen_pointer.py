@@ -386,8 +386,8 @@ def cmd_train(args) -> int:
             batch = {k: v.to(dev) for k, v in batch.items()}
             loss = model(**batch).loss / args.grad_accum
             loss.backward()
-            run = float(loss) * args.grad_accum if run is None else \
-                0.98 * run + 0.02 * float(loss) * args.grad_accum
+            step_loss = loss.detach().item() * args.grad_accum
+            run = step_loss if run is None else 0.98 * run + 0.02 * step_loss
             if (i + 1) % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad], 1.0)
@@ -532,6 +532,43 @@ def cmd_eval(args) -> int:
 
 
 # --------------------------------------------------------------------------
+# stats -- decide the task shape from the data, before training on it
+# --------------------------------------------------------------------------
+
+
+def cmd_stats(args) -> int:
+    import collections
+
+    recs = [json.loads(l) for l in open(os.path.join(args.data, "manifest.jsonl"))]
+    print(f"{len(recs)} images, {sum(len(r['nodules']) for r in recs)} nodule labels, "
+          f"{len({r['patient_id'] for r in recs})} patients\n")
+    print("LIDC marks both >=3mm nodules (contoured) and <3mm nodules (a single")
+    print("point). The builder gives a single-point mark radius exactly 1.5mm, so")
+    print("radius > 1.5 is the contoured subset -- the ones a radiologist outlined.\n")
+
+    for thr in (0.0, 1.51, 3.0):
+        hist, n_nod = collections.Counter(), 0
+        for r in recs:
+            k = sum(1 for n in r["nodules"] if n.get("radius_mm", 0) > thr)
+            hist[k] += 1
+            n_nod += k
+        label = "all marks" if thr == 0 else f"radius > {thr}mm"
+        per = " ".join(f"{k}:{hist[k]}" for k in sorted(hist)[:8])
+        print(f"  {label:<16} {n_nod:5d} nodules | per-image  {per}")
+        print(f"  {'':<16} exactly-one: {hist[1]:4d} images | "
+              f">=1 (usable for 'largest'): {sum(v for k, v in hist.items() if k):4d}")
+    print()
+
+    skip = os.path.join(args.data, "skipped.jsonl")
+    if os.path.exists(skip):
+        c = collections.Counter(json.loads(l).get("reason") for l in open(skip))
+        print("skipped.jsonl:")
+        for reason, n in c.most_common():
+            print(f"  {n:6d}  {reason}")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # selftest -- runs with no GPU, no model, no dataset
 # --------------------------------------------------------------------------
 
@@ -620,10 +657,14 @@ def main(argv=None) -> int:
     pe.add_argument("--skip-zeroshot", action="store_true")
     pe.add_argument("--verbose", action="store_true", default=True)
 
+    ps = sub.add_parser("stats")
+    ps.add_argument("--data", required=True)
+
     sub.add_parser("selftest")
 
     args = ap.parse_args(argv)
-    return {"train": cmd_train, "eval": cmd_eval, "selftest": cmd_selftest}[args.cmd](args)
+    return {"train": cmd_train, "eval": cmd_eval, "stats": cmd_stats,
+            "selftest": cmd_selftest}[args.cmd](args)
 
 
 if __name__ == "__main__":
