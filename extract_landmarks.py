@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from typing import Dict, List, Optional
@@ -153,24 +154,46 @@ def find_carina(vol, airway: np.ndarray = None) -> Dict:
     if len(zs) < 10:
         return dict(valid=False, reason="no air column")
 
-    seen_single = None
-    run = 0
+    # Track the trachea down by continuity. Without this, oesophageal or neck
+    # air near the top of the scan reads as "two blobs" within a few slices of
+    # the start, and the carina gets placed up at the lung apices.
+    sz = float(vol.spacing[2])
+    cands = {z: blobs(z) for z in range(min(zs), max(zs) + 1)}
+
+    def near(b, pos, mm=25.0):
+        return [c for c in b
+                if math.hypot((c[1] - pos[0]) * sx, (c[2] - pos[1]) * sy) < mm]
+
+    pos, last_z, run_mm = None, None, 0.0
     for z in range(max(zs), min(zs) - 1, -1):
-        b = blobs(z)
-        if len(b) == 1:
-            seen_single = (z, b[0])
-            run = 0
-        elif len(b) >= 2 and seen_single is not None:
-            run += 1
-            if run >= 3:                        # split, and it stayed split
-                zc, (_, ii, jj) = seen_single
-                v = torch.tensor([ii, jj, float(zc)], dtype=torch.float64)
-                return dict(valid=True, mm=vol.voxel_to_mm(v), z_index=zc)
+        b = cands.get(z, [])
+        if pos is None:
+            if len(b) == 1:
+                pos, last_z, run_mm = (b[0][1], b[0][2]), z, 0.0
+            continue
+
+        nb = near(b, pos)
+        if len(nb) == 1:
+            pos, last_z = (nb[0][1], nb[0][2]), z
+            run_mm += sz
+        elif len(nb) >= 2:
+            # A real bifurcation: the two lumina straddle the trachea, and we
+            # must already have followed a decent length of single lumen.
+            xs = sorted(c[1] for c in nb)
+            split_mm = (xs[-1] - xs[0]) * sx
+            below = [len(near(cands.get(z - d, []), pos)) for d in (1, 2, 3)]
+            if run_mm >= 30.0 and split_mm >= 8.0 and all(n >= 2 for n in below):
+                v = torch.tensor([pos[0], pos[1], float(last_z)], dtype=torch.float64)
+                return dict(valid=True, mm=vol.voxel_to_mm(v), z_index=last_z,
+                            tracked_mm=run_mm)
         else:
-            run = 0
-    if seen_single is None:
+            if run_mm < 30.0:            # a short spurious column; start over
+                pos, run_mm = None, 0.0
+
+    if pos is None:
         return dict(valid=False, reason="no trachea-sized midline air column")
-    return dict(valid=False, reason="no bifurcation below the trachea")
+    return dict(valid=False,
+                reason=f"no bifurcation below a {run_mm:.0f}mm tracked trachea")
 
 
 def extract(vol, want: Optional[List[str]] = None) -> Dict[str, Dict]:
@@ -215,6 +238,13 @@ def extract(vol, want: Optional[List[str]] = None) -> Dict[str, Dict]:
     c = find_carina(vol)
     out["carina"] = (dict(valid=True, mm=[float(t) for t in c["mm"]])
                      if c["valid"] else c)
+    # A carina at or above the lung apices is not a carina. Drop it rather than
+    # hand a confidently-wrong 3D target downstream.
+    ap_z = [out[k]["mm"][2] for k in ("lung_apex_left", "lung_apex_right")
+            if out.get(k, {}).get("valid")]
+    if out["carina"].get("valid") and ap_z:
+        if out["carina"]["mm"][2] >= min(ap_z) - 20.0:
+            out["carina"] = dict(valid=False, reason="carina above/at the lung apices")
 
     # spine: bone centroid, taken at the carina's height when we have one so the
     # landmark is a defined point rather than "somewhere along the column"
