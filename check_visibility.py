@@ -60,11 +60,23 @@ def cnr(img: np.ndarray, cx: float, cy: float, r_px: float,
                 r_px=float(r_px))
 
 
+def auc(pos: np.ndarray, neg: np.ndarray) -> float:
+    """P(a random positive scores above a random negative). 0.5 = no signal."""
+    if not len(pos) or not len(neg):
+        return float("nan")
+    allv = np.concatenate([pos, neg])
+    ranks = allv.argsort().argsort().astype(np.float64) + 1
+    rp = ranks[:len(pos)].sum()
+    return float((rp - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))
+
+
 def run(args) -> int:
     from PIL import Image
 
+    rng = np.random.default_rng(0)
     recs = [json.loads(l) for l in open(os.path.join(args.data, "manifest.jsonl"))]
     rows: List[Dict] = []
+    ctrl: List[float] = []
     for r in recs[:args.limit or len(recs)]:
         path = os.path.join(args.data, r["image"])
         if not os.path.exists(path):
@@ -81,6 +93,17 @@ def run(args) -> int:
                 rows.append(m | dict(image=r["image"], view=r["view"],
                                      radius_mm=rad, x=x, y=y,
                                      patient=r["patient_id"]))
+                # Controls: the same measurement at nearby locations where no
+                # nodule was annotated. If the true sites do not score higher
+                # than these, there is nothing in the image to find -- an
+                # absolute CNR below 1 does not by itself prove that.
+                for _ in range(args.controls):
+                    ang = rng.uniform(0, 2 * math.pi)
+                    dist = rng.uniform(40, 120)
+                    cm = cnr(img, x + dist * math.cos(ang), y + dist * math.sin(ang),
+                             rad / mm_per_px)
+                    if cm:
+                        ctrl.append(cm["cnr"])
     if not rows:
         print("no measurable nodules"); return 1
 
@@ -98,17 +121,31 @@ def run(args) -> int:
     print(f"  |CNR| < 3 (marginal):   {below3:.1%}")
     print(f"  |CNR| >= 3 (visible):   {1 - below3:.1%}\n")
 
-    if below1 > 0.5:
-        print("  VERDICT: most nodules are below the visibility floor. The gate is")
-        print("  not failing -- the target is not in the picture. Fix the rendering")
-        print("  (window the lung field, raise detector resolution, thinner slab)")
-        print("  before training anything else.")
-    elif below3 > 0.5:
-        print("  VERDICT: marginal. A model may find the large ones only; expect the")
-        print("  error distribution to be bimodal rather than merely wide.")
-    else:
-        print("  VERDICT: nodules are visible. A failed gate is a model/data-size")
-        print("  problem, not a rendering one.")
+    # The control decides it. Absolute CNR is low for real nodules on real
+    # radiographs too -- a 2% signal against 10% rib-and-vessel clutter is the
+    # physics, not a bug. What matters is whether annotated sites differ from
+    # arbitrary ones at all.
+    if ctrl:
+        cc = np.array(ctrl)
+        a = auc(np.abs(c), np.abs(cc))
+        print(f"  control (same images, no nodule there, n={len(cc)}):")
+        print(f"    CNR median {np.median(cc):6.2f} vs {np.median(c):6.2f} at nodules")
+        print(f"    |CNR| AUC nodule-vs-control: {a:.3f}   "
+              f"(0.50 = indistinguishable)\n")
+        if abs(a - 0.5) < 0.03:
+            print("  VERDICT: annotated sites are statistically indistinguishable from")
+            print("  arbitrary ones at this resolution. Local contrast alone cannot")
+            print("  find these nodules -- and neither windowing nor a bigger model")
+            print("  changes that, because a linear re-window scales signal and")
+            print("  clutter together. Raise detector resolution, or accept that this")
+            print("  task needs shape/context reasoning rather than local contrast.")
+        else:
+            print(f"  VERDICT: there is measurable signal (AUC {a:.3f}). Low absolute")
+            print("  CNR is expected -- real radiologists work at this contrast too.")
+            print("  A failed gate is then a data-size or training problem.")
+    elif below1 > 0.5:
+        print("  VERDICT: low absolute contrast. Re-run with --controls to find out")
+        print("  whether that means 'invisible' or merely 'as hard as a real X-ray'.")
 
     by_view: Dict[str, List[float]] = {}
     for r in rows:
@@ -187,6 +224,11 @@ def selftest() -> int:
     t("gap keeps blur out of the background", a >= b - 1e-9, f"gap=2 {a:.2f} vs gap=1 {b:.2f}")
     t("off-image returns None", cnr(flat, -50, -50, 5) is None)
 
+    t("AUC of identical distributions is 0.5",
+      abs(auc(rng.normal(0, 1, 4000), rng.normal(0, 1, 4000)) - 0.5) < 0.03)
+    t("AUC of clearly separated distributions is ~1",
+      auc(rng.normal(5, 1, 2000), rng.normal(0, 1, 2000)) > 0.99)
+
     print("\n" + ("all self-tests passed" if ok else "SELF-TESTS FAILED"))
     return 0 if ok else 1
 
@@ -197,6 +239,8 @@ def main(argv=None) -> int:
     ap.add_argument("--data")
     ap.add_argument("--min-radius-mm", type=float, default=3.0)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--controls", type=int, default=3,
+                    help="control measurements per nodule (0 to disable)")
     ap.add_argument("--montage", default=None, help="write a crop montage here")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args(argv)
