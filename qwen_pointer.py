@@ -350,52 +350,42 @@ class PointerDataset:
         return Image.open(path).convert("RGB")
 
     def __getitem__(self, i):
-        import torch
         s = self.samples[i]
         msgs = build_messages(s.image)
         prompt = self.processor.apply_chat_template(msgs, tokenize=False,
                                                     add_generation_prompt=True)
         answer = format_answer(s.x1000, s.y1000) + (self.processor.tokenizer.eos_token or "")
-        img = self._image(s.image)
-
-        full = self.processor(text=[prompt + answer], images=[img], return_tensors="pt")
-        only = self.processor(text=[prompt], images=[img], return_tensors="pt")
-        n_prompt = only["input_ids"].shape[1]
-
-        # Only the text tensors carry a batch dim to strip. `pixel_values` is
-        # already [n_patches, dim] and `image_grid_thw` is [n_images, 3] --
-        # indexing [0] there throws the image away and the vision tower then
-        # sees one patch where the grid claims thousands.
-        item = {k: (v[0] if k in TEXT_KEYS else v) for k, v in full.items()}
-        labels = item["input_ids"].clone()
-        labels[:n_prompt] = -100                       # loss on the answer only
-        item["labels"] = labels
-        return item
+        n_ans = len(self.processor.tokenizer(answer, add_special_tokens=False)["input_ids"])
+        return dict(text=prompt + answer, image=self._image(s.image), n_answer=n_ans)
 
 
-def collate(batch, pad_id: int):
+def collate(batch, processor):
     """
-    Text tensors are padded to a rectangle; everything else -- pixel_values,
-    image_grid_thw -- is concatenated along dim 0, because Qwen packs all
-    images of a batch into one flat patch sequence and describes them with one
-    grid row each. Stacking those instead of concatenating is the same bug in
-    a different place.
+    Let the processor batch its own outputs.
+
+    Hand-rolling this meant knowing, per key, whether to pad or concatenate --
+    and the processor emits keys whose shapes are sequence-length-dependent,
+    which broke the moment two samples tokenised to different lengths. Calling
+    the processor once on the whole batch keeps that knowledge where it belongs
+    and survives version changes.
+
+    Loss is placed on the last `n_answer` real tokens of each row, which is the
+    answer: with right padding the real region is [0, len_i), so no separate
+    prompt-only pass is needed to find where the answer starts.
     """
     import torch
 
-    out = {}
-    n = max(b["input_ids"].shape[0] for b in batch)
-    for k in batch[0].keys():
-        vals = [b[k] for b in batch]
-        if k in TEXT_KEYS:
-            pad = {"input_ids": pad_id, "attention_mask": 0,
-                   "labels": -100, "token_type_ids": 0}[k]
-            out[k] = torch.stack([
-                torch.cat([v, torch.full((n - v.shape[0],), pad, dtype=v.dtype)])
-                for v in vals])
-        else:
-            out[k] = torch.cat(vals, dim=0)
-    return out
+    enc = processor(text=[b["text"] for b in batch],
+                    images=[b["image"] for b in batch],
+                    return_tensors="pt", padding=True)
+    labels = torch.full_like(enc["input_ids"], -100)
+    lens = enc["attention_mask"].sum(dim=1)
+    for i, b in enumerate(batch):
+        end = int(lens[i])
+        start = max(0, end - int(b["n_answer"]))
+        labels[i, start:end] = enc["input_ids"][i, start:end]
+    enc["labels"] = labels
+    return dict(enc)
 
 
 # --------------------------------------------------------------------------
@@ -443,7 +433,7 @@ def cmd_train(args) -> int:
     dl = DataLoader(PointerDataset(train_s, processor, args.max_pixels),
                     batch_size=args.batch_size, shuffle=True,
                     num_workers=args.workers,
-                    collate_fn=lambda b: collate(b, pad_id))
+                    collate_fn=lambda b: collate(b, processor))
 
     steps = max(1, len(dl) // args.grad_accum) * args.epochs
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
