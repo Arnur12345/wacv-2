@@ -57,13 +57,31 @@ RELATIONS = {
 }
 
 
-def robust_flags(v: np.ndarray, k: float = 4.0):
-    """Median/MAD outlier score. MAD is unmoved by the outliers it is finding."""
+# Relations whose plausible range is known from anatomy, not from the data.
+# A tail test cannot judge these: it only knows what is unusual, not what is
+# impossible.
+PLAUSIBLE = {"lung_height_left_mm": (140.0, 400.0),
+             "lung_height_right_mm": (140.0, 400.0)}
+
+SCALE_FLOOR_MM = 4.0
+
+
+def robust_flags(v: np.ndarray, k: float = 4.0, floor: float = SCALE_FLOOR_MM):
+    """
+    Median/MAD outlier score, with a floor on the scale.
+
+    MAD alone fails on a spiky distribution. Both lung apices are percentiles of
+    the same z grid, so most patients get *exactly* the same value and the MAD
+    collapses towards zero -- after which a benign 1mm asymmetry scores as a
+    25-sigma outlier and 40% of the cohort gets flagged. The floor says: a
+    difference smaller than a few millimetres is not evidence of anything,
+    however tight the distribution around it is.
+    """
     med = float(np.median(v))
     mad = float(np.median(np.abs(v - med))) * 1.4826
-    if mad < 1e-9:
-        return np.zeros_like(v), med, mad
-    return (v - med) / mad, med, mad
+    iqr = float(np.percentile(v, 75) - np.percentile(v, 25)) / 1.349
+    scale = max(mad, iqr, floor)
+    return (v - med) / scale, med, scale
 
 
 def load(data_dir: str):
@@ -117,7 +135,10 @@ def main(argv=None) -> int:
         v = np.array(vals)
         score, med, mad = robust_flags(v, args.k)
         bad = np.abs(score) > args.k
-        print(f"  {rel:26} median {med:8.1f}  MAD {mad:6.1f}  "
+        if rel in PLAUSIBLE:
+            lo, hi = PLAUSIBLE[rel]
+            bad = bad | (v < lo) | (v > hi)
+        print(f"  {rel:26} median {med:8.1f}  scale {mad:6.1f}  "
               f"p1..p99 [{np.percentile(v, 1):7.1f},{np.percentile(v, 99):7.1f}]  "
               f"flagged {int(bad.sum()):3d}  -- {desc}")
         report[rel] = dict(median=med, mad=mad, n=len(v), flagged=int(bad.sum()))
@@ -143,6 +164,15 @@ def main(argv=None) -> int:
     worst = sorted(flagged.items(), key=lambda kv: -len(kv[1]))[:20]
     for k, rs in worst:
         print(f"  {meta[k]:18} {', '.join(rs[:3])}")
+
+    impossible = sorted({k for k, rs in flagged.items()
+                         if any(r.split("=")[0] in PLAUSIBLE for r in rs)})
+    print(f"\n{len(impossible)} series are anatomically impossible, not merely "
+          f"unusual ({len(impossible) / max(len(per), 1):.1%}) -- drop these:")
+    for k in impossible[:20]:
+        print(f"  {meta[k]:18} {k}")
+    with open(os.path.join(args.data, "drop_series.txt"), "w") as f:
+        f.write("\n".join(impossible))
 
     out = os.path.join(args.data, "landmark_qc.json")
     with open(out, "w") as f:
