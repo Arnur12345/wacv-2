@@ -183,6 +183,35 @@ def window_to_png(img: np.ndarray, lo_pct: float = 0.5, hi_pct: float = 99.5):
     return (out * 255).astype(np.uint8), float(lo), float(hi)
 
 
+def landmark_targets(vol, cfg) -> List[Dict]:
+    """
+    Anatomical landmarks as targets, in the same shape as nodule clusters.
+
+    Centroids are the primary target: a centroid of a two-million-voxel mask
+    barely moves when the HU threshold shifts or a few slices are noisy, which
+    is what E1 needs -- the precision of the target sets the floor on the error
+    covariance the experiment is trying to measure. The carina is sharper but
+    is recovered in only ~half of scans, so it rides along as a secondary.
+    """
+    from extract_landmarks import anatomy_checks, extract
+
+    lm = extract(vol)
+    bad = set()
+    for v in anatomy_checks(lm):
+        bad.add(v.split()[0] if v.startswith("carina") else "")
+    out = []
+    for name in cfg["landmarks"]:
+        d = lm.get(name, {})
+        if not d.get("valid"):
+            continue
+        if name == "carina" and any(v.startswith("carina") for v in anatomy_checks(lm)):
+            continue
+        out.append(dict(center_mm=[float(t) for t in d["mm"]],
+                        radius_mm=5.0, n_readers=0, reader_spread_mm=0.0,
+                        sop_uid="", n_points=0, name=name))
+    return out
+
+
 def process_series(task: Dict) -> Dict:
     """Render one series and label every consensus nodule in it."""
     import torch
@@ -203,10 +232,17 @@ def process_series(task: Dict) -> Dict:
     rec["size"] = list(vol.size_ijk)
     rec["spacing"] = [float(s) for s in vol.spacing]
 
-    nodules = cluster_nodules(vol, task["xml"], cfg["cluster_mm"], cfg["min_readers"])
-    rec["n_nodule_clusters"] = len(nodules)
-    kept = [n for n in nodules if n["kept"]]
-    for n in nodules:
+    if cfg["targets"] == "landmarks":
+        kept = landmark_targets(vol, cfg)
+        nodules = kept
+        rec["n_nodule_clusters"] = len(kept)
+        if not kept:
+            rec["skipped"].append(dict(reason="no_valid_landmark"))
+    else:
+        nodules = cluster_nodules(vol, task["xml"], cfg["cluster_mm"], cfg["min_readers"])
+        rec["n_nodule_clusters"] = len(nodules)
+        kept = [n for n in nodules if n["kept"]]
+    for n in (nodules if cfg["targets"] != "landmarks" else []):
         if not n["kept"]:
             rec["skipped"].append(dict(reason="too_few_readers",
                                        detail=f"{n['n_readers']} reader(s)",
@@ -236,7 +272,7 @@ def process_series(task: Dict) -> Dict:
                 dropped += 1
                 continue
             err = float("nan")
-            if cfg["verify"]:
+            if cfg["verify"] and cfg["targets"] != "landmarks":
                 try:
                     dv, _ = nodule_difference_volume(vol, centers[i], n["radius_mm"])
                     shadow = view.with_volume(dv).render(n_samples=cfg["samples"])
@@ -255,6 +291,7 @@ def process_series(task: Dict) -> Dict:
                     continue
             x, y = float(uc[i]), float(ur[i])
             nods.append(dict(
+                name=n.get("name", "nodule"),
                 center_mm=n["center_mm"], radius_mm=n["radius_mm"],
                 n_readers=n["n_readers"], reader_spread_mm=n["reader_spread_mm"],
                 pixel=[round(x, 2), round(y, 2)],
@@ -315,6 +352,11 @@ def main(argv=None) -> int:
     ap.add_argument("--det-size", nargs=2, type=int, default=[504, 504],
                     help="detector pixels; keep a multiple of 14")
     ap.add_argument("--samples", type=int, default=192, help="DRR samples per ray")
+    ap.add_argument("--targets", choices=["nodules", "landmarks"], default="nodules")
+    ap.add_argument("--landmarks", nargs="+",
+                    default=["lung_apex_left", "lung_apex_right",
+                             "costophrenic_recess_left", "costophrenic_recess_right",
+                             "lung_centroid_left", "lung_centroid_right"])
     ap.add_argument("--min-readers", type=int, default=3)
     ap.add_argument("--cluster-mm", type=float, default=8.0)
     ap.add_argument("--shadow-tol", type=float, default=4.0,
@@ -329,7 +371,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     os.makedirs(os.path.join(args.out, "images"), exist_ok=True)
-    cfg = dict(out=args.out, views=args.views, det_size=args.det_size,
+    cfg = dict(targets=args.targets, landmarks=args.landmarks,
+               out=args.out, views=args.views, det_size=args.det_size,
                samples=args.samples, min_readers=args.min_readers,
                cluster_mm=args.cluster_mm, shadow_tol=args.shadow_tol,
                verify=not args.no_verify)
@@ -337,7 +380,7 @@ def main(argv=None) -> int:
     print(f"scanning {args.root} ...", flush=True)
     t0 = time.time()
     series, xmls = scan_tree(args.root)
-    annotated = [s for s in series if s.xml]
+    annotated = series if args.targets == "landmarks" else [s for s in series if s.xml]
     print(f"  {len(series)} CT series, {len(xmls)} annotation XMLs, "
           f"{len(annotated)} paired ({time.time() - t0:.0f}s)")
 

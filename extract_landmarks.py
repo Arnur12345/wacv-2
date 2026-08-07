@@ -253,10 +253,13 @@ def extract(vol, want: Optional[List[str]] = None) -> Dict[str, Dict]:
             valid=bool(top.sum() >= 20),
             mm=[float(x[top].mean()), float(y[top].mean()), float(z[top].mean())],
             n_voxels=int(top.sum()))
-        # diaphragm dome: most inferior lung voxels -- the lung/liver interface
+        # Costophrenic recess: the most INFERIOR lung voxels. Named "diaphragm
+        # dome" in an earlier version, which was wrong -- the dome is the
+        # highest point of the diaphragm; this is the deepest angle. It is a
+        # sharp, high-contrast corner, which is what makes it a good target.
         zb = np.percentile(z[sel], 0.5)
         bot = sel & (z <= zb)
-        out[f"diaphragm_dome_{side}"] = dict(
+        out[f"costophrenic_recess_{side}"] = dict(
             valid=bool(bot.sum() >= 20),
             mm=[float(x[bot].mean()), float(y[bot].mean()), float(z[bot].mean())],
             n_voxels=int(bot.sum()))
@@ -307,8 +310,13 @@ def extract(vol, want: Optional[List[str]] = None) -> Dict[str, Dict]:
 # --------------------------------------------------------------------------
 
 
-E1_SET = ["carina", "lung_apex_left", "lung_apex_right",
-          "diaphragm_dome_left", "diaphragm_dome_right"]
+# Primary targets are visible features: apices are boundary extremes, recesses
+# are sharp high-contrast corners. Centroids carry no local contrast at all --
+# they sit in uniform parenchyma and must be inferred from the lung silhouette
+# -- so they are secondary, and they need a silhouette-only baseline.
+E1_SET = ["lung_apex_left", "lung_apex_right",
+          "costophrenic_recess_left", "costophrenic_recess_right",
+          "lung_centroid_left", "lung_centroid_right"]
 
 
 def anatomy_checks(lm: Dict[str, Dict]) -> List[str]:
@@ -319,7 +327,7 @@ def anatomy_checks(lm: Dict[str, Dict]) -> List[str]:
     bad = []
     g = lambda k: lm.get(k, {}).get("mm") if lm.get(k, {}).get("valid") else None
     car, al, ar = g("carina"), g("lung_apex_left"), g("lung_apex_right")
-    dl, dr, sp = g("diaphragm_dome_left"), g("diaphragm_dome_right"), g("spine_centroid")
+    dl, dr, sp = g("costophrenic_recess_left"), g("costophrenic_recess_right"), g("spine_centroid")
 
     if car and abs(car[0]) > 45:
         bad.append(f"carina off-midline (x={car[0]:.0f}mm)")
@@ -395,7 +403,7 @@ def scan(args) -> int:
         fig, axes = plt.subplots(2, len(panels), figsize=(5.2 * len(panels), 10),
                                  squeeze=False)
         colors = dict(carina="r", lung_apex_left="c", lung_apex_right="c",
-                      diaphragm_dome_left="y", diaphragm_dome_right="y")
+                      costophrenic_recess_left="y", costophrenic_recess_right="y")
         for col, (pid, vol, lm) in enumerate(panels):
             for row, orient in enumerate(("PA", "LAT")):
                 view = DRRView.standard(vol, orient)
@@ -452,7 +460,7 @@ def selftest() -> int:
     if al.get("valid") and lc.get("valid"):
         t("apex is superior to the centroid", al["mm"][2] > lc["mm"][2],
           f"apex z {al['mm'][2]:.1f} > centroid z {lc['mm'][2]:.1f}")
-    dl = lm.get("diaphragm_dome_left", {})
+    dl = lm.get("costophrenic_recess_left", {})
     if dl.get("valid") and lc.get("valid"):
         t("diaphragm dome is inferior to the centroid", dl["mm"][2] < lc["mm"][2],
           f"dome z {dl['mm'][2]:.1f} < centroid z {lc['mm'][2]:.1f}")
