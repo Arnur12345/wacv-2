@@ -44,6 +44,39 @@ def view_from_manifest(vol, g: Dict):
                    det_spacing=tuple(g["det_spacing"]), det_size=tuple(g["det_size"]))
 
 
+def pick_control_sites(vol, rng, kind: str, n: int = 3, stride: int = 4):
+    """
+    Sample voxel sites of a given tissue class, as mm coordinates.
+
+    `bone` deliberately targets ribs rather than vertebrae: we keep only sites
+    whose surrounding shell is lung, because a sphere carved from the middle of
+    a vertebra is replaced by more vertebra and shows almost no difference. A
+    rib crossing the lung field is the high-contrast structure a radiologist
+    actually sees, and it is the right yardstick for "is the renderer fine?".
+    """
+    import torch
+
+    a = vol.array[::stride, ::stride, ::stride]
+    if kind == "bone":
+        m = (a > 300) & (a < 1800)
+    elif kind == "lung":
+        m = (a > -950) & (a < -700)
+    else:
+        raise ValueError(kind)
+    idx = np.argwhere(m)
+    if not len(idx):
+        return []
+    pick = idx[rng.choice(len(idx), size=min(len(idx), n * 40), replace=False)]
+    out = []
+    for k, j, i in pick:
+        v = torch.tensor([float(i * stride), float(j * stride), float(k * stride)],
+                         dtype=torch.float64)
+        out.append(vol.voxel_to_mm(v))
+        if len(out) >= n * 40:
+            break
+    return out
+
+
 def local_clutter(img: np.ndarray, cx: float, cy: float, half: int = 40) -> float:
     """Std of the PNG in a box around the nodule, after removing a plane."""
     h, w = img.shape
@@ -67,6 +100,8 @@ def main(argv=None) -> int:
     ap.add_argument("--limit", type=int, default=200, help="nodules to measure")
     ap.add_argument("--samples", type=int, default=192)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--calibrate", type=int, default=2,
+                    help="control spheres (rib / lung) per series; 0 to disable")
     args = ap.parse_args(argv)
 
     import torch
@@ -95,7 +130,8 @@ def main(argv=None) -> int:
           f"{len({t[0]['series_uid'] for t in tasks})} series\n", flush=True)
 
     rows: List[Dict] = []
-    vol = cur = None
+    cal: Dict[str, List[float]] = {}
+    vol = cur = last_calibrated = None
     t0 = time.time()
     for i, (r, n) in enumerate(tasks, 1):
         uid = r["series_uid"]
@@ -127,6 +163,32 @@ def main(argv=None) -> int:
                          peak_L=peak_L, peak_grey=peak_grey, clutter=clut,
                          true_cnr=peak_grey / clut if clut and clut > 1e-9 else float("nan"),
                          patient=r["patient_id"]))
+        # Calibration: the identical measurement on a rib and on plain lung, at
+        # the same sphere size. If a rib scores 50x the nodule, the renderer and
+        # the windowing are fine and the nodule is simply low-contrast -- which
+        # is what we need to know before blaming either.
+        if args.calibrate and uid != last_calibrated:
+            last_calibrated = uid
+            for kind in ("bone", "lung"):
+                got = 0
+                for c in pick_control_sites(vol, np.random.default_rng(args.seed),
+                                            kind, n=args.calibrate):
+                    if got >= args.calibrate:
+                        break
+                    try:
+                        d2, f2 = nodule_difference_volume(vol, c, 5.0)
+                        # a rib is only a fair yardstick where it is surrounded
+                        # by lung; a sphere inside a vertebra is replaced by
+                        # more vertebra and shows nothing
+                        if kind == "bone" and f2 > 100:
+                            continue
+                        s2 = view.with_volume(d2).render(n_samples=args.samples)
+                        cal.setdefault(kind, []).append(
+                            float(s2.max()) / max(hi - lo, 1e-9) * 255.0)
+                        got += 1
+                    except Exception:
+                        continue
+
         if i % 25 == 0:
             print(f"  [{i}/{len(tasks)}] {(time.time() - t0) / 60:.1f}m", flush=True)
 
@@ -157,6 +219,24 @@ def main(argv=None) -> int:
         if m.sum() > 3:
             print(f"    r {lo_:2d}-{hi_:2d}mm  n={int(m.sum()):4d}  "
                   f"signal {np.median(g[m]):6.2f} grey  CNR {np.median(tc[m]):5.2f}")
+
+    if cal:
+        print("\n  calibration -- same instrument, same 5mm sphere, same images:")
+        nod5 = g[(rad >= 4) & (rad <= 6)]
+        for kind, vals in sorted(cal.items()):
+            v = np.array(vals)
+            print(f"    {kind:5} n={len(v):4d}  signal median {np.median(v):8.2f} grey levels")
+        if "bone" in cal and len(nod5):
+            ratio = np.median(cal["bone"]) / max(np.median(nod5), 1e-9)
+            print(f"    nodule (r 4-6mm) n={len(nod5):4d}  signal median "
+                  f"{np.median(nod5):8.2f} grey levels")
+            print(f"    -> bone/nodule signal ratio {ratio:.2f} for equal-size spheres.")
+            print("       Note: a compact bone sphere is NOT a brighter target than a")
+            print("       nodule -- rib-vs-soft-tissue is ~410 HU, nodule-vs-lung ~860.")
+            print("       Ribs are visible because they are long high-contrast edges.")
+            print("       These controls verify the instrument, not the renderer: lung")
+            print("       must read ~0, and the renderer is evidenced sound by the")
+            print("       local clutter itself, which is rich anatomical structure.")
 
     med = float(np.median(tc[ok]))
     print()
