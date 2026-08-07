@@ -59,6 +59,26 @@ PROMPTS = {
 }
 PROMPT = PROMPTS["largest"]
 
+LANDMARK_PHRASE = {
+    "lung_apex_left": "the apex (topmost point) of the patient's LEFT lung",
+    "lung_apex_right": "the apex (topmost point) of the patient's RIGHT lung",
+    "costophrenic_recess_left": "the left costophrenic recess "
+                               "(the sharp bottom corner of the left lung)",
+    "costophrenic_recess_right": "the right costophrenic recess "
+                                "(the sharp bottom corner of the right lung)",
+    "lung_centroid_left": "the centre of the patient's LEFT lung",
+    "lung_centroid_right": "the centre of the patient's RIGHT lung",
+}
+
+
+def set_landmark(name: Optional[str]):
+    """Ask for the landmark by name; a vague prompt is an unanswerable task."""
+    global PROMPT
+    if not name:
+        return
+    what = LANDMARK_PHRASE.get(name, name.replace("_", " "))
+    PROMPT = (_IMG + f"Find {what}. " + _ASK)
+
 
 def set_target_mode(mode: str):
     global PROMPT
@@ -130,7 +150,8 @@ class Sample:
 
 def load_manifest(data_dir: str, split: str, multi: str = "largest",
                   views: Optional[List[str]] = None,
-                  min_radius_mm: float = 3.0) -> Tuple[List[Sample], Dict]:
+                  min_radius_mm: float = 3.0,
+                  landmark: Optional[str] = None) -> Tuple[List[Sample], Dict]:
     """
     Read manifest.jsonl into samples.
 
@@ -147,7 +168,8 @@ def load_manifest(data_dir: str, split: str, multi: str = "largest",
         raise FileNotFoundError(f"{path} -- run build_drr_dataset.py first")
 
     out, stats = [], dict(records=0, wrong_split=0, too_small=0, multi_nodule=0,
-                          no_nodule=0, missing_image=0, wrong_view=0)
+                          no_nodule=0, missing_image=0, wrong_view=0,
+                          wrong_landmark=0)
     for line in open(path):
         r = json.loads(line)
         stats["records"] += 1
@@ -159,6 +181,14 @@ def load_manifest(data_dir: str, split: str, multi: str = "largest",
             continue
         nods = [n for n in r.get("nodules", [])
                 if float(n.get("radius_mm", 0)) >= min_radius_mm]
+        if landmark:
+            # Landmarks all share a nominal radius, so "largest" cannot pick
+            # among them -- it would train on an arbitrary one per image. Select
+            # by name and the target becomes well defined again.
+            before = len(nods)
+            nods = [n for n in nods if n.get("name") == landmark]
+            if before and not nods:
+                stats["wrong_landmark"] += 1
         if not nods:
             stats["too_small" if r.get("nodules") else "no_nodule"] += 1
             continue
@@ -375,14 +405,17 @@ def collate(batch, pad_id: int):
 
 def cmd_train(args) -> int:
     set_target_mode(args.multi)
+    set_landmark(args.landmark)
     import torch
     from peft import LoraConfig, get_peft_model
     from torch.utils.data import DataLoader
 
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
 
-    train_s, st = load_manifest(args.data, "train", args.multi, args.views, args.min_radius_mm)
-    val_s, sv = load_manifest(args.data, "val", args.multi, args.views, args.min_radius_mm)
+    train_s, st = load_manifest(args.data, "train", args.multi, args.views, args.min_radius_mm,
+                                   args.landmark)
+    val_s, sv = load_manifest(args.data, "val", args.multi, args.views, args.min_radius_mm,
+                                   args.landmark)
     if args.limit:
         train_s, val_s = train_s[:args.limit], val_s[:max(4, args.limit // 8)]
     print(f"train {len(train_s)} samples / {st['patients']} patients, "
@@ -492,8 +525,11 @@ def _generate(model, processor, samples, args) -> List[Optional[Tuple[float, flo
 
 def cmd_eval(args) -> int:
     set_target_mode(args.multi)
-    train_s, _ = load_manifest(args.data, "train", args.multi, args.views, args.min_radius_mm)
-    test_s, st = load_manifest(args.data, args.split, args.multi, args.views, args.min_radius_mm)
+    set_landmark(args.landmark)
+    train_s, _ = load_manifest(args.data, "train", args.multi, args.views, args.min_radius_mm,
+                                   args.landmark)
+    test_s, st = load_manifest(args.data, args.split, args.multi, args.views, args.min_radius_mm,
+                                   args.landmark)
     if args.limit:
         test_s = test_s[:args.limit]
     if not test_s:
@@ -678,6 +714,8 @@ def main(argv=None) -> int:
         p.add_argument("--max-pixels", type=int, default=512 * 512)
         p.add_argument("--multi", choices=["largest", "any", "single"],
                        default="largest", help="what a multi-nodule image means")
+        p.add_argument("--landmark", default=None,
+                       help="target one landmark by name, e.g. lung_apex_left")
         p.add_argument("--min-radius-mm", type=float, default=3.0,
                        help="drop LIDC <3mm single-point marks")
         p.add_argument("--views", nargs="*", default=None, help="e.g. PA")
