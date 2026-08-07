@@ -30,7 +30,8 @@ import numpy as np
 
 
 def cnr(img: np.ndarray, cx: float, cy: float, r_px: float,
-        inner: float = 1.0, gap: float = 2.0, outer: float = 4.0) -> Optional[Dict]:
+        inner: float = 1.0, gap: float = 2.0, outer: float = 4.0,
+        detrend: bool = True) -> Optional[Dict]:
     """
     Contrast of a disk against the annulus around it.
 
@@ -52,10 +53,24 @@ def cnr(img: np.ndarray, cx: float, cy: float, r_px: float,
     m_out = (d >= gap * r_px) & (d <= outer * r_px)
     if m_in.sum() < 3 or m_out.sum() < 12:
         return None
+    raw_out = patch[m_out].mean()
+
+    # Remove the local intensity gradient first. Nodules sit in dark lung, and
+    # an annulus a few radii wide reaches into chest wall, mediastinum or
+    # diaphragm -- all much brighter. Without detrending, the measurement
+    # returns the lung-to-chest-wall slope, and returns *more* of it for bigger
+    # nodules, which is how a real signal can come out looking negative.
+    if detrend:
+        A = np.stack([xx[m_out].ravel() - cx, yy[m_out].ravel() - cy,
+                      np.ones(int(m_out.sum()))], axis=1)
+        coef, *_ = np.linalg.lstsq(A, patch[m_out].ravel(), rcond=None)
+        plane = coef[0] * (xx - cx) + coef[1] * (yy - cy) + coef[2]
+        patch = patch - plane
+
     a, b = patch[m_in].mean(), patch[m_out].mean()
     sd = patch[m_out].std()
     return dict(cnr=float((a - b) / sd) if sd > 1e-9 else 0.0,
-                weber=float((a - b) / b) if abs(b) > 1e-9 else 0.0,
+                weber=float((a - b) / raw_out) if abs(raw_out) > 1e-9 else 0.0,
                 mean_in=float(a), mean_out=float(b), std_out=float(sd),
                 r_px=float(r_px))
 
@@ -222,6 +237,22 @@ def selftest() -> int:
     a = cnr(img, 100, 100, 5)["cnr"]
     b = cnr(img, 100, 100, 5, gap=1.0)["cnr"]
     t("gap keeps blur out of the background", a >= b - 1e-9, f"gap=2 {a:.2f} vs gap=1 {b:.2f}")
+    # The real situation: a visible nodule sitting on the lung-to-chest-wall
+    # slope. Undetrended, the slope buries it and can even flip its sign --
+    # which is exactly what made bigger nodules score *more* negative.
+    yy2, xx2 = np.mgrid[0:200, 0:200]
+    grad = flat + 3.0 * xx2 + 30 * (np.hypot(xx2 - 100, yy2 - 100) <= 5)
+    with_dt = cnr(grad, 100, 100, 5)["cnr"]
+    without = cnr(grad, 100, 100, 5, detrend=False)["cnr"]
+    t("detrending recovers a blob buried in a strong gradient",
+      with_dt > 2.5 and without < 1.5,
+      f"detrended {with_dt:.2f} vs raw {without:.2f}")
+    ramp = flat + 0.8 * xx2
+    t("pure gradient, no blob -> CNR ~ 0 after detrending",
+      abs(cnr(ramp, 100, 100, 5)["cnr"]) < 0.5, f"{cnr(ramp, 100, 100, 5)['cnr']:.3f}")
+    t("bigger disk on a gradient is not penalised",
+      cnr(grad, 100, 100, 12)["cnr"] > cnr(grad, 100, 100, 12, detrend=False)["cnr"])
+
     t("off-image returns None", cnr(flat, -50, -50, 5) is None)
 
     t("AUC of identical distributions is 0.5",
