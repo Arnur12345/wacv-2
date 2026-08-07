@@ -42,11 +42,27 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-PROMPT = ("This is a chest radiograph (a DRR rendered from CT). "
-          "There is exactly one pulmonary nodule in it. "
-          "Reply with only its centre as JSON: {\"x\": <0-1000>, \"y\": <0-1000>}, "
-          "where x and y are the position across and down the image, "
-          "normalised to 0-1000.")
+_ASK = ("Reply with only its centre as JSON: {\"x\": <0-1000>, \"y\": <0-1000>}, "
+        "where x and y are the position across and down the image, "
+        "normalised to 0-1000.")
+_IMG = "This is a chest radiograph (a DRR rendered from CT). "
+
+# The prompt has to be true of the image it is attached to. LIDC images carry
+# 1-8 nodules, so "there is exactly one" is a lie for most of them, and a lie
+# in the prompt is indistinguishable from a model that cannot see.
+PROMPTS = {
+    "largest": _IMG + "It contains one or more pulmonary nodules. "
+                      "Find the LARGEST one. " + _ASK,
+    "single":  _IMG + "There is exactly one pulmonary nodule in it. " + _ASK,
+    "any":     _IMG + "It contains one or more pulmonary nodules. "
+                      "Find any one of them. " + _ASK,
+}
+PROMPT = PROMPTS["largest"]
+
+
+def set_target_mode(mode: str):
+    global PROMPT
+    PROMPT = PROMPTS[mode]
 
 # tensors with a batch dim to strip / pad; everything else the processor
 # returns (pixel_values, image_grid_thw, ...) is already flat across images
@@ -107,22 +123,30 @@ class Sample:
     view: str
     radius_mm: float
     n_readers: int
+    # every nodule in the same image, for the lenient "did it find *a* nodule"
+    # metric -- an image with 8 nodules should not be graded as if it had one
+    all_xy1000: Tuple[Tuple[float, float], ...] = ()
 
 
-def load_manifest(data_dir: str, split: str, multi: str = "drop",
-                  views: Optional[List[str]] = None) -> Tuple[List[Sample], Dict]:
+def load_manifest(data_dir: str, split: str, multi: str = "largest",
+                  views: Optional[List[str]] = None,
+                  min_radius_mm: float = 3.0) -> Tuple[List[Sample], Dict]:
     """
     Read manifest.jsonl into samples.
 
-    An image with two nodules cannot supervise "where is *the* nodule" -- the
-    same picture would carry two contradictory answers -- so by default those
-    images are dropped and counted rather than quietly duplicated.
+    `min_radius_mm` drops LIDC's <3mm single-point marks and keeps the nodules
+    a radiologist actually outlined. `multi` decides what an image with several
+    nodules means:
+
+      largest  target is the biggest one; every image with >=1 nodule is used
+      any      same target, but graded against the nearest nodule (lenient)
+      single   only images left with exactly one nodule -- clean but small
     """
     path = os.path.join(data_dir, "manifest.jsonl")
     if not os.path.exists(path):
         raise FileNotFoundError(f"{path} -- run build_drr_dataset.py first")
 
-    out, stats = [], dict(records=0, wrong_split=0, multi_nodule=0,
+    out, stats = [], dict(records=0, wrong_split=0, too_small=0, multi_nodule=0,
                           no_nodule=0, missing_image=0, wrong_view=0)
     for line in open(path):
         r = json.loads(line)
@@ -133,11 +157,12 @@ def load_manifest(data_dir: str, split: str, multi: str = "drop",
         if views and r["view"] not in views:
             stats["wrong_view"] += 1
             continue
-        nods = r.get("nodules", [])
+        nods = [n for n in r.get("nodules", [])
+                if float(n.get("radius_mm", 0)) >= min_radius_mm]
         if not nods:
-            stats["no_nodule"] += 1
+            stats["too_small" if r.get("nodules") else "no_nodule"] += 1
             continue
-        if len(nods) > 1 and multi == "drop":
+        if len(nods) > 1 and multi == "single":
             stats["multi_nodule"] += 1
             continue
         img = os.path.join(data_dir, r["image"])
@@ -145,15 +170,20 @@ def load_manifest(data_dir: str, split: str, multi: str = "drop",
             stats["missing_image"] += 1
             continue
         mm_per_px = float(r.get("geometry", {}).get("det_spacing", [1.0])[0])
-        for n in (nods[:1] if multi == "first" else nods):
-            x, y = n["pixel_norm1000"]
-            out.append(Sample(image=img, x1000=float(x), y1000=float(y),
-                              width=r["width"], height=r["height"],
-                              mm_per_px=mm_per_px, patient_id=r["patient_id"],
-                              view=r["view"], radius_mm=float(n.get("radius_mm", 0)),
-                              n_readers=int(n.get("n_readers", 0))))
+        target = max(nods, key=lambda n: float(n.get("radius_mm", 0)))
+        x, y = target["pixel_norm1000"]
+        out.append(Sample(image=img, x1000=float(x), y1000=float(y),
+                          width=r["width"], height=r["height"],
+                          mm_per_px=mm_per_px, patient_id=r["patient_id"],
+                          view=r["view"], radius_mm=float(target.get("radius_mm", 0)),
+                          n_readers=int(target.get("n_readers", 0)),
+                          all_xy1000=tuple((float(n["pixel_norm1000"][0]),
+                                            float(n["pixel_norm1000"][1]))
+                                           for n in nods)))
     stats["kept"] = len(out)
     stats["patients"] = len({s.patient_id for s in out})
+    stats["nodules_per_image"] = (round(float(np.mean([len(s.all_xy1000) for s in out])), 2)
+                                  if out else 0)
     return out, stats
 
 
@@ -175,7 +205,7 @@ def score(preds: List[Optional[Tuple[float, float]]], samples: List[Sample],
     included in the hit rates and in `parse_fail`, so nothing improves the
     score by refusing to answer.
     """
-    errs, fails = [], 0
+    errs, near, fails = [], [], 0
     for p, s in zip(preds, samples):
         if p is None:
             fails += 1
@@ -183,14 +213,22 @@ def score(preds: List[Optional[Tuple[float, float]]], samples: List[Sample],
         px, py = to_pixels(p[0], p[1], s.width, s.height)
         tx, ty = to_pixels(s.x1000, s.y1000, s.width, s.height)
         errs.append(math.hypot(px - tx, py - ty) * s.mm_per_px)
+        # lenient: distance to whichever nodule in this image is closest
+        cands = s.all_xy1000 or ((s.x1000, s.y1000),)
+        near.append(min(math.hypot(*(np.subtract(to_pixels(cx, cy, s.width, s.height),
+                                                 (px, py)))) * s.mm_per_px
+                        for cx, cy in cands))
     n = len(samples)
     e = np.array(errs) if errs else np.zeros(0)
+    a = np.array(near) if near else np.zeros(0)
     out = dict(n=n, parse_fail=fails,
                median_mm=float(np.median(e)) if e.size else None,
                mean_mm=float(e.mean()) if e.size else None,
-               p90_mm=float(np.percentile(e, 90)) if e.size else None)
+               p90_mm=float(np.percentile(e, 90)) if e.size else None,
+               nearest_median_mm=float(np.median(a)) if a.size else None)
     for t in thresholds_mm:
         out[f"hit@{t:g}mm"] = float((e <= t).sum()) / n if n else 0.0
+        out[f"nearhit@{t:g}mm"] = float((a <= t).sum()) / n if n else 0.0
     return out
 
 
@@ -204,9 +242,10 @@ def centre_baseline(train: List[Sample], test: List[Sample]) -> Dict:
 def fmt(name: str, m: Dict) -> str:
     if m.get("median_mm") is None:
         return f"  {name:<10} no parseable predictions ({m['parse_fail']}/{m['n']} failed)"
-    return (f"  {name:<10} median {m['median_mm']:6.1f} mm | mean {m['mean_mm']:6.1f} | "
-            f"p90 {m['p90_mm']:6.1f} | hit@10mm {m['hit@10mm']:.1%} | "
-            f"hit@20mm {m['hit@20mm']:.1%}" +
+    return (f"  {name:<10} median {m['median_mm']:6.1f} mm | p90 {m['p90_mm']:6.1f} | "
+            f"hit@10mm {m['hit@10mm']:.1%} | hit@20mm {m['hit@20mm']:.1%} "
+            f"|| nearest: median {m['nearest_median_mm']:6.1f} "
+            f"hit@10mm {m['nearhit@10mm']:.1%}" +
             (f" | {m['parse_fail']} unparseable" if m["parse_fail"] else ""))
 
 
@@ -335,20 +374,23 @@ def collate(batch, pad_id: int):
 
 
 def cmd_train(args) -> int:
+    set_target_mode(args.multi)
     import torch
     from peft import LoraConfig, get_peft_model
     from torch.utils.data import DataLoader
 
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
 
-    train_s, st = load_manifest(args.data, "train", args.multi, args.views)
-    val_s, sv = load_manifest(args.data, "val", args.multi, args.views)
+    train_s, st = load_manifest(args.data, "train", args.multi, args.views, args.min_radius_mm)
+    val_s, sv = load_manifest(args.data, "val", args.multi, args.views, args.min_radius_mm)
     if args.limit:
         train_s, val_s = train_s[:args.limit], val_s[:max(4, args.limit // 8)]
     print(f"train {len(train_s)} samples / {st['patients']} patients, "
           f"val {len(val_s)} / {sv['patients']}")
-    print(f"  dropped: {st['multi_nodule']} multi-nodule, {st['no_nodule']} no-nodule, "
-          f"{st['missing_image']} missing image")
+    print(f"  target={args.multi!r} min_radius={args.min_radius_mm}mm | "
+          f"{st['nodules_per_image']} nodules/image | dropped: "
+          f"{st['too_small']} all-nodules-too-small, {st['multi_nodule']} multi-nodule")
+    print(f"  prompt: {PROMPT[:96]}...")
     if not train_s:
         print("no training data"); return 1
 
@@ -449,8 +491,9 @@ def _generate(model, processor, samples, args) -> List[Optional[Tuple[float, flo
 
 
 def cmd_eval(args) -> int:
-    train_s, _ = load_manifest(args.data, "train", args.multi, args.views)
-    test_s, st = load_manifest(args.data, args.split, args.multi, args.views)
+    set_target_mode(args.multi)
+    train_s, _ = load_manifest(args.data, "train", args.multi, args.views, args.min_radius_mm)
+    test_s, st = load_manifest(args.data, args.split, args.multi, args.views, args.min_radius_mm)
     if args.limit:
         test_s = test_s[:args.limit]
     if not test_s:
@@ -633,7 +676,10 @@ def main(argv=None) -> int:
         p.add_argument("--dtype", default="bfloat16")
         p.add_argument("--batch-size", type=int, default=4)
         p.add_argument("--max-pixels", type=int, default=512 * 512)
-        p.add_argument("--multi", choices=["drop", "first", "all"], default="drop")
+        p.add_argument("--multi", choices=["largest", "any", "single"],
+                       default="largest", help="what a multi-nodule image means")
+        p.add_argument("--min-radius-mm", type=float, default=3.0,
+                       help="drop LIDC <3mm single-point marks")
         p.add_argument("--views", nargs="*", default=None, help="e.g. PA")
         p.add_argument("--limit", type=int, default=0)
         p.add_argument("--workers", type=int, default=0)
