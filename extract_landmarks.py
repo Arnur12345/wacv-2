@@ -164,36 +164,44 @@ def find_carina(vol, airway: np.ndarray = None) -> Dict:
         return [c for c in b
                 if math.hypot((c[1] - pos[0]) * sx, (c[2] - pos[1]) * sy) < mm]
 
-    pos, last_z, run_mm = None, None, 0.0
+    # Seed on the blob nearest the midline, not on "the only blob on this
+    # slice": almost every scan has a second air pocket somewhere, and
+    # requiring uniqueness meant most scans never seeded at all.
+    #
+    # The carina is then simply where the tracked single-lumen column ENDS.
+    # Requiring a visible two-blob split fails on real anatomy, because below
+    # the carina the main bronchi diverge laterally and leave the search window
+    # within a slice or two -- which is what "no bifurcation below a 108mm
+    # tracked trachea" was reporting about a perfectly good trachea.
+    best = None
     for z in range(max(zs), min(zs) - 1, -1):
         b = cands.get(z, [])
-        if pos is None:
-            if len(b) == 1:
-                pos, last_z, run_mm = (b[0][1], b[0][2]), z, 0.0
+        if not b:
+            continue
+        seed = min(b, key=lambda c: abs(c[1] - mid_i))
+        if abs(seed[1] - mid_i) * sx > 30.0:
             continue
 
-        nb = near(b, pos)
-        if len(nb) == 1:
-            pos, last_z = (nb[0][1], nb[0][2]), z
+        pos, last_z, run_mm = (seed[1], seed[2]), z, 0.0
+        for z2 in range(z - 1, min(zs) - 1, -1):
+            nb = near(cands.get(z2, []), pos)
+            if len(nb) != 1:
+                break                     # split, or lost: the column ends here
+            pos, last_z = (nb[0][1], nb[0][2]), z2
             run_mm += sz
-        elif len(nb) >= 2:
-            # A real bifurcation: the two lumina straddle the trachea, and we
-            # must already have followed a decent length of single lumen.
-            xs = sorted(c[1] for c in nb)
-            split_mm = (xs[-1] - xs[0]) * sx
-            below = [len(near(cands.get(z - d, []), pos)) for d in (1, 2, 3)]
-            if run_mm >= 30.0 and split_mm >= 8.0 and all(n >= 2 for n in below):
-                v = torch.tensor([pos[0], pos[1], float(last_z)], dtype=torch.float64)
-                return dict(valid=True, mm=vol.voxel_to_mm(v), z_index=last_z,
-                            tracked_mm=run_mm)
-        else:
-            if run_mm < 30.0:            # a short spurious column; start over
-                pos, run_mm = None, 0.0
+        if best is None or run_mm > best[0]:
+            best = (run_mm, pos, last_z)
+        if run_mm >= 60.0:                # a convincing trachea; stop searching
+            break
 
-    if pos is None:
+    if best is None:
         return dict(valid=False, reason="no trachea-sized midline air column")
-    return dict(valid=False,
-                reason=f"no bifurcation below a {run_mm:.0f}mm tracked trachea")
+    run_mm, pos, last_z = best
+    if run_mm < 40.0:
+        return dict(valid=False,
+                    reason=f"midline air column only {run_mm:.0f}mm long")
+    v = torch.tensor([pos[0], pos[1], float(last_z)], dtype=torch.float64)
+    return dict(valid=True, mm=vol.voxel_to_mm(v), z_index=last_z, tracked_mm=run_mm)
 
 
 def extract(vol, want: Optional[List[str]] = None) -> Dict[str, Dict]:
@@ -238,13 +246,23 @@ def extract(vol, want: Optional[List[str]] = None) -> Dict[str, Dict]:
     c = find_carina(vol)
     out["carina"] = (dict(valid=True, mm=[float(t) for t in c["mm"]])
                      if c["valid"] else c)
-    # A carina at or above the lung apices is not a carina. Drop it rather than
-    # hand a confidently-wrong 3D target downstream.
-    ap_z = [out[k]["mm"][2] for k in ("lung_apex_left", "lung_apex_right")
-            if out.get(k, {}).get("valid")]
-    if out["carina"].get("valid") and ap_z:
-        if out["carina"]["mm"][2] >= min(ap_z) - 20.0:
-            out["carina"] = dict(valid=False, reason="carina above/at the lung apices")
+    # Plausibility gate against the lung mask. Gastric and bowel air also form
+    # trachea-sized midline columns, but they sit low and anterior, so bound the
+    # carina to the upper-middle of the lung field. Drop, never guess.
+    if out["carina"].get("valid"):
+        cx, cy, cz = out["carina"]["mm"]
+        z_lo, z_hi = float(np.percentile(z, 1)), float(np.percentile(z, 99))
+        frac = (cz - z_lo) / max(z_hi - z_lo, 1e-6)
+        y_lo, y_hi = float(np.percentile(y, 2)), float(np.percentile(y, 98))
+        why = None
+        if not (0.35 <= frac <= 0.95):
+            why = f"carina at {frac:.0%} of lung height (expect 35-95%)"
+        elif abs(cx - float(np.median(x))) > 40.0:
+            why = f"carina {abs(cx - float(np.median(x))):.0f}mm off the lung midline"
+        elif not (y_lo <= cy <= y_hi):
+            why = "carina outside the lungs' anterior-posterior range"
+        if why:
+            out["carina"] = dict(valid=False, reason=why)
 
     # spine: bone centroid, taken at the carina's height when we have one so the
     # landmark is a defined point rather than "somewhere along the column"
