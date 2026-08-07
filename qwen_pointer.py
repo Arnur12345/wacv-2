@@ -48,6 +48,10 @@ PROMPT = ("This is a chest radiograph (a DRR rendered from CT). "
           "where x and y are the position across and down the image, "
           "normalised to 0-1000.")
 
+# tensors with a batch dim to strip / pad; everything else the processor
+# returns (pixel_values, image_grid_thw, ...) is already flat across images
+TEXT_KEYS = ("input_ids", "attention_mask", "labels", "token_type_ids")
+
 
 # --------------------------------------------------------------------------
 # answer format -- shared by training targets and eval parsing
@@ -212,12 +216,16 @@ def fmt(name: str, m: Dict) -> str:
 
 
 def load_model(model_id: str, dtype="bfloat16", adapter: Optional[str] = None,
-               train: bool = False):
+               train: bool = False, max_pixels: int = 512 * 512):
     import torch
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     td = getattr(torch, dtype)
-    processor = AutoProcessor.from_pretrained(model_id)
+    # Bound the token count here, not by pre-resizing the PIL image: left to its
+    # defaults the processor will happily upscale a 504x504 DRR to ~896x896 and
+    # hand the vision tower 4096 patches per image.
+    processor = AutoProcessor.from_pretrained(
+        model_id, min_pixels=64 * 28 * 28, max_pixels=max_pixels)
     model = AutoModelForImageTextToText.from_pretrained(
         model_id, dtype=td, device_map=None, attn_implementation="sdpa")
     model.to("cuda" if torch.cuda.is_available() else "cpu")
@@ -268,12 +276,9 @@ class PointerDataset:
 
     def _image(self, path):
         from PIL import Image
-        im = Image.open(path).convert("RGB")
-        n = im.width * im.height
-        if n > self.max_pixels:
-            f = math.sqrt(self.max_pixels / n)
-            im = im.resize((max(28, int(im.width * f)), max(28, int(im.height * f))))
-        return im
+        # sizing is the processor's job (min_pixels/max_pixels were set when it
+        # was loaded); resizing here as well would fight it
+        return Image.open(path).convert("RGB")
 
     def __getitem__(self, i):
         import torch
@@ -288,32 +293,39 @@ class PointerDataset:
         only = self.processor(text=[prompt], images=[img], return_tensors="pt")
         n_prompt = only["input_ids"].shape[1]
 
-        item = {k: v[0] for k, v in full.items()}
+        # Only the text tensors carry a batch dim to strip. `pixel_values` is
+        # already [n_patches, dim] and `image_grid_thw` is [n_images, 3] --
+        # indexing [0] there throws the image away and the vision tower then
+        # sees one patch where the grid claims thousands.
+        item = {k: (v[0] if k in TEXT_KEYS else v) for k, v in full.items()}
         labels = item["input_ids"].clone()
         labels[:n_prompt] = -100                       # loss on the answer only
-        if self.processor.tokenizer.pad_token_id is not None:
-            labels[labels == self.processor.tokenizer.pad_token_id] = -100
         item["labels"] = labels
         return item
 
 
 def collate(batch, pad_id: int):
+    """
+    Text tensors are padded to a rectangle; everything else -- pixel_values,
+    image_grid_thw -- is concatenated along dim 0, because Qwen packs all
+    images of a batch into one flat patch sequence and describes them with one
+    grid row each. Stacking those instead of concatenating is the same bug in
+    a different place.
+    """
     import torch
 
-    keys = batch[0].keys()
     out = {}
     n = max(b["input_ids"].shape[0] for b in batch)
-    for k in keys:
+    for k in batch[0].keys():
         vals = [b[k] for b in batch]
-        if k in ("input_ids", "attention_mask", "labels"):
-            pad = {"input_ids": pad_id, "attention_mask": 0, "labels": -100}[k]
+        if k in TEXT_KEYS:
+            pad = {"input_ids": pad_id, "attention_mask": 0,
+                   "labels": -100, "token_type_ids": 0}[k]
             out[k] = torch.stack([
                 torch.cat([v, torch.full((n - v.shape[0],), pad, dtype=v.dtype)])
                 for v in vals])
-        elif vals[0].dim() >= 1:
-            out[k] = torch.cat(vals, dim=0) if k.startswith("pixel") else torch.stack(vals)
         else:
-            out[k] = torch.stack(vals)
+            out[k] = torch.cat(vals, dim=0)
     return out
 
 
@@ -340,7 +352,8 @@ def cmd_train(args) -> int:
     if not train_s:
         print("no training data"); return 1
 
-    model, processor = load_model(args.model, args.dtype, train=True)
+    model, processor = load_model(args.model, args.dtype, train=True,
+                                 max_pixels=args.max_pixels)
     cfg = LoraConfig(r=args.rank, lora_alpha=2 * args.rank, lora_dropout=0.05,
                      bias="none", task_type="CAUSAL_LM",
                      target_modules=lora_targets(model))
@@ -451,7 +464,8 @@ def cmd_eval(args) -> int:
 
     rows = []
     if not args.skip_zeroshot:
-        model, processor = load_model(args.model, args.dtype)
+        model, processor = load_model(args.model, args.dtype,
+                                      max_pixels=args.max_pixels)
         model.eval()
         preds, raw = _generate(model, processor, test_s, args)
         results["zero-shot"] = score(preds, test_s)
@@ -461,7 +475,8 @@ def cmd_eval(args) -> int:
         gc.collect(); torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     if args.adapter:
-        model, processor = load_model(args.model, args.dtype, adapter=args.adapter)
+        model, processor = load_model(args.model, args.dtype, adapter=args.adapter,
+                                      max_pixels=args.max_pixels)
         model.eval()
         preds, raw = _generate(model, processor, test_s, args)
         results["tuned"] = score(preds, test_s)
