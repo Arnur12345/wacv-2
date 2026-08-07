@@ -101,35 +101,76 @@ def _centroid_mm(vol, mask: np.ndarray):
     return vol.voxel_to_mm(v)
 
 
-def find_carina(vol, airway: np.ndarray) -> Dict:
+def find_carina(vol, airway: np.ndarray = None) -> Dict:
     """
-    The tracheal bifurcation: descend the airway and find where one lumen
-    becomes two. Searched top-down, and required to stay split, so a single
-    noisy slice cannot fire it.
+    The tracheal bifurcation.
+
+    Selecting "the largest interior air component" does NOT give the airway:
+    well-aerated lung is also below -950 HU, so that component is the lungs,
+    and walking down it finds the two lung apices splitting -- which is how an
+    earlier version placed the carina *above* the apices in 12 of 19 scans.
+
+    The trachea is separated instead by cross-sectional area: ~150-300 mm2 per
+    slice, against thousands for a lung. Track that blob down, and the carina is
+    the last slice where it is still one lumen.
     """
+    import SimpleITK as sitk
     import torch
 
-    nz = airway.shape[0]
-    zs = [z for z in range(nz) if airway[z].any()]
+    a = vol.array
+    sx, sy, _ = vol.spacing
+    px_mm2 = float(sx * sy)
+    air = a < -975.0
+
+    # midline from the body mask, since patients are not centred in the scanner
+    body = a > -500.0
+    if body.sum() < 1000:
+        return dict(valid=False, reason="no body mask")
+    mid_i = float(np.nonzero(body)[2].mean())
+
+    def blobs(z):
+        """Trachea-sized, near-midline air blobs on one slice: (area, i, j)."""
+        m = air[z]
+        if not m.any():
+            return []
+        lab = sitk.GetArrayFromImage(sitk.RelabelComponent(
+            sitk.ConnectedComponent(sitk.GetImageFromArray(m.astype(np.uint8)))))
+        out = []
+        for v in range(1, min(int(lab.max()), 12) + 1):
+            sel = lab == v
+            area = float(sel.sum()) * px_mm2
+            if not (30.0 <= area <= 900.0):        # excludes lung outright
+                continue
+            jj, ii = np.nonzero(sel)
+            if abs(ii.mean() - mid_i) * sx > 50.0:
+                continue
+            out.append((area, float(ii.mean()), float(jj.mean())))
+        return out
+
+    nz = a.shape[0]
+    # +z is superior and numpy axis 0 is k, so descend from the top of the scan
+    zs = [z for z in range(nz) if air[z].any()]
     if len(zs) < 10:
-        return dict(valid=False, reason="airway too short")
-    # +z is superior, and numpy axis 0 is k; walk from superior downwards
-    order = sorted(zs, reverse=True)
+        return dict(valid=False, reason="no air column")
+
+    seen_single = None
     run = 0
-    for z in order:
-        lab, sizes = _cc(airway[z][None, ...])
-        big = [s for s in sizes if s > 12]
-        if len(big) >= 2:
+    for z in range(max(zs), min(zs) - 1, -1):
+        b = blobs(z)
+        if len(b) == 1:
+            seen_single = (z, b[0])
+            run = 0
+        elif len(b) >= 2 and seen_single is not None:
             run += 1
-            if run >= 3:                       # split, and it stayed split
-                z0 = z + 2
-                lab2, _ = _cc(airway[z0][None, ...])
-                k, j, i = np.nonzero(np.repeat(lab2 > 0, 1, axis=0))
-                v = torch.tensor([i.mean(), j.mean(), float(z0)], dtype=torch.float64)
-                return dict(valid=True, mm=vol.voxel_to_mm(v), z_index=z0)
+            if run >= 3:                        # split, and it stayed split
+                zc, (_, ii, jj) = seen_single
+                v = torch.tensor([ii, jj, float(zc)], dtype=torch.float64)
+                return dict(valid=True, mm=vol.voxel_to_mm(v), z_index=zc)
         else:
             run = 0
-    return dict(valid=False, reason="no bifurcation found")
+    if seen_single is None:
+        return dict(valid=False, reason="no trachea-sized midline air column")
+    return dict(valid=False, reason="no bifurcation below the trachea")
 
 
 def extract(vol, want: Optional[List[str]] = None) -> Dict[str, Dict]:
@@ -171,13 +212,9 @@ def extract(vol, want: Optional[List[str]] = None) -> Dict[str, Dict]:
             mm=[float(x[bot].mean()), float(y[bot].mean()), float(z[bot].mean())],
             n_voxels=int(bot.sum()))
 
-    aw = airway_mask(vol)
-    if aw is None or aw.sum() < 200:
-        out["carina"] = dict(valid=False, reason="no airway mask")
-    else:
-        c = find_carina(vol, aw)
-        out["carina"] = (dict(valid=True, mm=[float(t) for t in c["mm"]])
-                         if c["valid"] else c)
+    c = find_carina(vol)
+    out["carina"] = (dict(valid=True, mm=[float(t) for t in c["mm"]])
+                     if c["valid"] else c)
 
     # spine: bone centroid, taken at the carina's height when we have one so the
     # landmark is a defined point rather than "somewhere along the column"
