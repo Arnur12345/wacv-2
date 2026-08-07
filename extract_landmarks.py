@@ -140,7 +140,7 @@ def find_carina(vol, airway: np.ndarray = None) -> Dict:
         for v in range(1, min(int(lab.max()), 12) + 1):
             sel = lab == v
             area = float(sel.sum()) * px_mm2
-            if not (30.0 <= area <= 900.0):        # excludes lung outright
+            if not (20.0 <= area <= 1200.0):       # excludes lung outright
                 continue
             jj, ii = np.nonzero(sel)
             if abs(ii.mean() - mid_i) * sx > 50.0:
@@ -182,11 +182,29 @@ def find_carina(vol, airway: np.ndarray = None) -> Dict:
         if abs(seed[1] - mid_i) * sx > 30.0:
             continue
 
-        pos, last_z, run_mm = (seed[1], seed[2]), z, 0.0
+        pos, last_z, run_mm, gap = (seed[1], seed[2]), z, 0.0, 0
         for z2 in range(z - 1, min(zs) - 1, -1):
             nb = near(cands.get(z2, []), pos)
-            if len(nb) != 1:
-                break                     # split, or lost: the column ends here
+            if not nb:
+                # a slice where the lumen falls outside the area window; tolerate
+                # a short gap rather than declaring the trachea finished
+                gap += 1
+                if gap > 3:
+                    break
+                continue
+            gap = 0
+            if len(nb) > 1:
+                xs = [c[1] for c in nb]
+                ys = [c[2] for c in nb]
+                dx = (max(xs) - min(xs)) * sx
+                dy = (max(ys) - min(ys)) * sy
+                if dx >= 8.0 and dx > dy:
+                    break                 # left-right split: this is the carina
+                # Otherwise it is the oesophagus, which runs directly posterior
+                # to the trachea and is well inside the search radius. Keep the
+                # anterior blob and carry on -- treating this as a bifurcation
+                # is what cut the tracked column to 11-38mm.
+                nb = [min(nb, key=lambda c: c[2])]
             pos, last_z = (nb[0][1], nb[0][2]), z2
             run_mm += sz
         if best is None or run_mm > best[0]:
