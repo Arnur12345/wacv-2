@@ -705,12 +705,62 @@ def cmd_eval(args) -> int:
     return 0
 
 
+
+@torch.no_grad()
+def cmd_probe(args) -> int:
+    """
+    Does the tower flatten patches row-major, the way PatchGrid assumes?
+
+    `w` indexes patches as row * n_cols + col. If the tower emits column-major
+    or windowed order, every weight lands on the wrong patch -- and nothing
+    errors, nothing NaNs, training just proceeds while attending to the wrong
+    places. Test it with content: put a bright square in one known patch and see
+    which token reacts.
+    """
+    from PIL import Image
+
+    cfg = FOAConfig(slot_grid=tuple(args.slot_grid), slot_dim=args.slot_dim,
+                    n_heads=args.heads)
+    foa, processor = build_model(args.model, cfg, rank=args.rank)
+    dev = next(foa.parameters()).device
+    dt = next(foa.parameters()).dtype
+    rows, cols = foa.token_grid
+    px = foa.patch_px
+
+    ok_all = True
+    for (r, c) in [(0, 1), (1, 0), (rows // 2, cols // 3), (rows - 1, cols - 1)]:
+        a = np.zeros((rows * px, cols * px, 3), np.uint8)
+        a[r * px:(r + 1) * px, c * px:(c + 1) * px] = 255
+        enc = processor(text=["x"], images=[Image.fromarray(a)], return_tensors="pt")
+        f = vision_features(foa.lm, enc["pixel_values"].to(dev, dt),
+                            enc["image_grid_thw"].to(dev)).float()
+        # the reacting token is the one furthest from the (mostly black) median
+        d = (f - f.median(dim=0).values).norm(dim=-1)
+        got = int(d.argmax())
+        want_row_major = r * cols + c
+        want_col_major = c * rows + r
+        tag = ("row-major" if got == want_row_major else
+               "COLUMN-MAJOR" if got == want_col_major else "UNKNOWN order")
+        ok_all &= (got == want_row_major)
+        print(f"  bright patch at (row={r}, col={c}): token {got} "
+              f"(row-major expects {want_row_major}) -> {tag}")
+
+    print()
+    if ok_all:
+        print("  PASS: the tower is row-major; w indexes patches correctly.")
+    else:
+        print("  FAIL: w is indexed in the wrong order. Do not run the gate --\n"
+              "  fix the flattening in build_w_matrix first, or every weight\n"
+              "  lands on the wrong patch and FOA loses for the wrong reason.")
+    return 0 if ok_all else 1
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selftest")
-    for name in ("cache", "train", "eval"):
+    for name in ("cache", "train", "eval", "probe"):
         p = sub.add_parser(name)
         p.add_argument("--data", required=True)
         p.add_argument("--landmark", default="lung_apex_left")
@@ -732,6 +782,8 @@ def main(argv=None) -> int:
         p.add_argument("--limit", type=int, default=0)
         p.add_argument("--tau-start", type=float, default=4.0)
         p.add_argument("--tau-end", type=float, default=1.0)
+        if name == "probe":
+            continue
         if name == "train":
             p.add_argument("--epochs", type=int, default=4)
             p.add_argument("--lr", type=float, default=2e-4)
@@ -745,7 +797,7 @@ def main(argv=None) -> int:
             p.add_argument("--split", default="test")
     args = ap.parse_args(argv)
     return {"selftest": lambda a: selftest(), "cache": cmd_cache,
-            "train": cmd_train, "eval": cmd_eval}[args.cmd](args)
+            "train": cmd_train, "eval": cmd_eval, "probe": cmd_probe}[args.cmd](args)
 
 
 if __name__ == "__main__":
