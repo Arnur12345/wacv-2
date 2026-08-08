@@ -151,7 +151,8 @@ def volume_box_mm(affine, size) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 def rebuild_views(sample: FOASample, n_views: Optional[int] = None,
-                  token_grid: Optional[Tuple[int, int]] = None):
+                  token_grid: Optional[Tuple[int, int]] = None,
+                  patch_px: int = PATCH_EFFECTIVE):
     """The exact DRRViews the images were rendered with, at patch=28."""
     from geometry_kernel import DRRView, CTVolume
 
@@ -164,11 +165,10 @@ def rebuild_views(sample: FOASample, n_views: Optional[int] = None,
     out = []
     for g in sample.view_specs[:n_views or len(sample.view_specs)]:
         model_hw = (None if token_grid is None
-                    else (token_grid[0] * PATCH_EFFECTIVE,
-                          token_grid[1] * PATCH_EFFECTIVE))
+                    else (token_grid[0] * patch_px, token_grid[1] * patch_px))
         v = DRRView(dummy, g["source_mm"], g["det_center_mm"], g["det_u"], g["det_v"],
                     det_spacing=tuple(g["det_spacing"]), det_size=tuple(g["det_size"]),
-                    patch=PATCH_EFFECTIVE, model_hw=model_hw)
+                    patch=patch_px, model_hw=model_hw)
         out.append(v)
     return out
 
@@ -383,13 +383,13 @@ def build_model(model_id: str, cfg: FOAConfig, rank: int = 16, dtype="bfloat16")
         task_type="CAUSAL_LM", target_modules=lora_targets(base)))
 
     lm_dim = base.get_input_embeddings().weight.shape[1]
-    patch_dim, token_grid = _probe_tower(base, processor, td)
+    patch_dim, token_grid, patch_px = _probe_tower(base, processor, td)
     foa = FOA(base, patch_dim=patch_dim, lm_dim=lm_dim, cfg=cfg)
-    foa.token_grid = token_grid
+    foa.token_grid, foa.patch_px = token_grid, patch_px
     foa.to("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  lm_dim={lm_dim} patch_dim={patch_dim} "
           f"token grid {token_grid[0]}x{token_grid[1]} = "
-          f"{token_grid[0]*token_grid[1]} per view | "
+          f"{token_grid[0]*token_grid[1]} per view at {patch_px}px | "
           f"trainable={sum(p.numel() for p in foa.parameters() if p.requires_grad):,}")
     return foa, processor
 
@@ -412,12 +412,20 @@ def _probe_tower(model, processor, td):
         f = vision_features(model, enc["pixel_values"].to(dev, td),
                             enc["image_grid_thw"].to(dev))
     t_, h, w = [int(x) for x in enc["image_grid_thw"][0]]
-    grid = (h // 2, w // 2)
-    n = grid[0] * grid[1]
-    if n != f.shape[0]:
-        raise ValueError(f"grid {grid} implies {n} tokens but the tower emitted "
-                         f"{f.shape[0]}; the merge factor is not 2x2 here")
-    return int(f.shape[-1]), grid
+    n_tok = int(f.shape[0])
+    # `image_grid_thw` counts 14px patches. Whether the tower hands back merged
+    # (h/2 x w/2, 28px) or unmerged (h x w, 14px) features differs by version,
+    # so infer it from the count instead of assuming either.
+    if n_tok == h * w:
+        grid, patch_px = (h, w), 14
+    elif n_tok == (h // 2) * (w // 2):
+        grid, patch_px = (h // 2, w // 2), 28
+    else:
+        raise ValueError(
+            f"tower emitted {n_tok} tokens for a {h}x{w} patch grid; that is "
+            f"neither unmerged ({h*w}) nor 2x2-merged ({(h//2)*(w//2)}). "
+            f"Inspect get_image_features before going further.")
+    return int(f.shape[-1]), grid, patch_px
 
 
 def vision_features(model, pixel_values, image_grid_thw) -> torch.Tensor:
@@ -486,7 +494,7 @@ def encode_sample(foa, processor, s: FOASample, slots: SlotGrid, cache, args,
     lo, hi = volume_box_mm(s.affine, s.volume_size)
     slot_mm = slots.coords_mm(lo, hi)
     key = w_cache_key(s.series_uid, key_views + [f"g{views[0].grid.n_patches}"],
-                      slots.grid, PATCH_EFFECTIVE)
+                      slots.grid, views[0].patch)
     w, f12 = geometry_for_sample(slot_mm, views, cache, key)
     w = w.double()
     if args.uniform_w:
