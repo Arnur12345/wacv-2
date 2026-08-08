@@ -145,6 +145,13 @@ class Gather(nn.Module):
         patches [B, P, Dv]   frozen vision-tower features, views concatenated
         log_w   [B, M, P]    additive bias from the geometry
         """
+        # The head is deliberately kept in fp32 while the frozen tower runs in
+        # bf16: it is small, and the log-w bias plus softmax are precisely where
+        # bf16 rounding would blunt the geometric constraint. Cast inputs up
+        # rather than casting the head down.
+        wd = self.q.weight.dtype
+        slots = slots.to(wd)
+        patches = patches.to(wd)
         B, M, _ = slots.shape
         P = patches.shape[1]
         q = self.q(slots).view(B, M, self.n_heads, self.head_dim).transpose(1, 2)
