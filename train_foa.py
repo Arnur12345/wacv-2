@@ -727,23 +727,44 @@ def cmd_probe(args) -> int:
     rows, cols = foa.token_grid
     px = foa.patch_px
 
+    def feats_of(img_arr):
+        enc = processor(text=["x"], images=[Image.fromarray(img_arr)],
+                        return_tensors="pt")
+        return vision_features(foa.lm, enc["pixel_values"].to(dev, dt),
+                               enc["image_grid_thw"].to(dev)).float()
+
+    # Differential probe. ViT features are contextualised and some tokens carry
+    # huge norms regardless of content ("registers"), so an absolute deviation
+    # finds those every time. Subtract the blank-image features and the only
+    # thing left is the response to the square.
+    blank = np.zeros((rows * px, cols * px, 3), np.uint8)
+    f0 = feats_of(blank)
+
+    probes = [(0, 1), (1, 0), (rows // 2, cols // 3), (rows - 1, cols - 1)]
+    got_idx = []
     ok_all = True
-    for (r, c) in [(0, 1), (1, 0), (rows // 2, cols // 3), (rows - 1, cols - 1)]:
-        a = np.zeros((rows * px, cols * px, 3), np.uint8)
+    for (r, c) in probes:
+        a = blank.copy()
         a[r * px:(r + 1) * px, c * px:(c + 1) * px] = 255
-        enc = processor(text=["x"], images=[Image.fromarray(a)], return_tensors="pt")
-        f = vision_features(foa.lm, enc["pixel_values"].to(dev, dt),
-                            enc["image_grid_thw"].to(dev)).float()
-        # the reacting token is the one furthest from the (mostly black) median
-        d = (f - f.median(dim=0).values).norm(dim=-1)
+        d = (feats_of(a) - f0).norm(dim=-1)
         got = int(d.argmax())
+        got_idx.append(got)
         want_row_major = r * cols + c
         want_col_major = c * rows + r
         tag = ("row-major" if got == want_row_major else
-               "COLUMN-MAJOR" if got == want_col_major else "UNKNOWN order")
+               "COLUMN-MAJOR" if got == want_col_major else "other")
+        share = float(d[got] / d.sum())
         ok_all &= (got == want_row_major)
-        print(f"  bright patch at (row={r}, col={c}): token {got} "
-              f"(row-major expects {want_row_major}) -> {tag}")
+        print(f"  bright patch at (row={r:2d}, col={c:2d}): token {got:4d} "
+              f"(row-major expects {want_row_major:4d}) -> {tag}"
+              f"   [response share {share:.1%}]")
+
+    if all(g == got_idx[0] for g in got_idx):
+        print("\n  Every probe picked the same token: the differential response is "
+              "not\n  spatially localised. Patch identity may not survive this "
+              "tower's\n  output; inspect get_image_features before trusting any "
+              "index map.")
+        return 1
 
     print()
     if ok_all:
