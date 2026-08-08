@@ -745,7 +745,11 @@ def cmd_probe(args) -> int:
     S0 = load_samples(args.data, args.landmark, args.views)
     det = S0[0].view_specs[0]["det_size"] if S0 else [504, 504]
     H, W = int(det[1]), int(det[0])
-    blank = np.zeros((H, W, 3), np.uint8)
+    # Base on a REAL DRR, not a black frame. A blank image is far out of
+    # distribution, so the whole feature map shifts and the differential is
+    # dominated by that global change rather than by a local response.
+    base_img = np.array(Image.open(S0[0].images[0]).convert("RGB").resize((W, H)))
+    blank = base_img
     f0 = feats_of(blank)
     if f0.shape[0] != rows * cols:
         raise ValueError(f"a {W}x{H} image gives {f0.shape[0]} tokens but the "
@@ -756,7 +760,8 @@ def cmd_probe(args) -> int:
     def response(mask_fn):
         a = blank.copy()
         mask_fn(a)
-        return (feats_of(a) - f0).norm(dim=-1).cpu().numpy()
+        d = (feats_of(a) - f0).norm(dim=-1)
+        return d.cpu().numpy()
 
     r0, c0 = rows // 2, cols // 3
     # token row/col -> source pixel span, the same proportional mapping PatchGrid
