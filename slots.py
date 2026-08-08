@@ -152,7 +152,8 @@ class Gather(nn.Module):
         v = self.v(patches).view(B, P, self.n_heads, self.head_dim).transpose(1, 2)
 
         logits = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        logits = logits + log_w[:, None, :, :]        # broadcast over heads
+        lw = log_w.to(device=logits.device, dtype=logits.dtype)
+        logits = logits + lw[:, None, :, :]        # broadcast over heads
         attn = logits.softmax(dim=-1)
 
         ctx = (attn @ v).transpose(1, 2).reshape(B, M, -1)
@@ -160,7 +161,7 @@ class Gather(nn.Module):
         # softmax over an all-masked row is uniform, and the slot would inject
         # an average of the whole image -- exactly the leak the mask exists to
         # prevent.
-        visible = (log_w > NEG_INF / 2).any(dim=-1, keepdim=True).to(ctx.dtype)
+        visible = (lw > NEG_INF / 2).any(dim=-1, keepdim=True).to(ctx.dtype)
         ctx = ctx * visible
         out = self.norm(slots + self.out(ctx))
         return (out, attn) if return_attn else out
@@ -234,7 +235,9 @@ class NullSpaceEncoder(nn.Module):
         nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, slots: torch.Tensor, feats12: torch.Tensor) -> torch.Tensor:
-        return slots + self.mlp(feats12.to(slots.dtype))[None]
+        # geometry is computed on CPU in float64; follow the slots
+        f = feats12.to(device=slots.device, dtype=slots.dtype)
+        return slots + self.mlp(f)[None]
 
 
 # --------------------------------------------------------------------------

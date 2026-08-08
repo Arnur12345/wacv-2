@@ -595,10 +595,11 @@ def cmd_train(args) -> int:
                         f"this is a configuration error, not bad data. Last: {e}")
                 continue
             tau = temperature_at(step, steps, args.tau_start, args.tau_end)
-            log_w = build_log_w(b["w"], temperature=tau)[None].to(
-                next(foa.parameters()).dtype)
+            dev = next(foa.parameters()).device
+            dt = next(foa.parameters()).dtype
+            log_w = build_log_w(b["w"], temperature=tau)[None].to(dev, dt)
             loss = foa(b["pre"], b["suf"], b["feats"], log_w,
-                       b["f12"].to(log_w.dtype), labels=b["labels"]).loss
+                       b["f12"].to(dev, dt), labels=b["labels"]).loss
             (loss / args.grad_accum).backward()
             run = float(loss.detach()) if run is None else 0.98 * run + 0.02 * float(loss.detach())
             n_ok += 1
@@ -661,9 +662,10 @@ def cmd_eval(args) -> int:
             except Exception:
                 n_fail += 1
                 continue
-            log_w = build_log_w(b["w"], temperature=args.tau_end)[None].to(
-                next(foa.parameters()).dtype)
-            tok = foa.slot_tokens(b["feats"], log_w, b["f12"].to(log_w.dtype))
+            dev = next(foa.parameters()).device
+            dt = next(foa.parameters()).dtype
+            log_w = build_log_w(b["w"], temperature=args.tau_end)[None].to(dev, dt)
+            tok = foa.slot_tokens(b["feats"], log_w, b["f12"].to(dev, dt))
             emb = foa.lm.get_input_embeddings()
             seq = torch.cat([emb(b["pre"]), tok.to(emb.weight.dtype),
                              emb(b["suf"])], dim=1)
