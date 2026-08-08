@@ -490,7 +490,8 @@ def encode_sample(foa, processor, s: FOASample, slots: SlotGrid, cache, args,
                        "view_specs": [s.view_specs[i] for i in view_idx],
                        "images": [s.images[i] for i in view_idx]})
     key_views = [f"{args.views[i]}" for i in view_idx]
-    views = rebuild_views(sub)
+    views = rebuild_views(sub, token_grid=getattr(foa, "token_grid", None),
+                          patch_px=getattr(foa, "patch_px", PATCH_EFFECTIVE))
     lo, hi = volume_box_mm(s.affine, s.volume_size)
     slot_mm = slots.coords_mm(lo, hi)
     key = w_cache_key(s.series_uid, key_views + [f"g{views[0].grid.n_patches}"],
@@ -526,11 +527,15 @@ def cmd_cache(args) -> int:
                 sub = FOASample(**{**s.__dict__,
                                    "view_specs": [s.view_specs[j] for j in idx],
                                    "images": [s.images[j] for j in idx]})
-                key = w_cache_key(s.series_uid, [args.views[j] for j in idx],
-                                  slots.grid, PATCH_EFFECTIVE)
+                n_p = args.token_grid[0] * args.token_grid[1] * len(idx)
+                key = w_cache_key(s.series_uid,
+                                  [args.views[j] for j in idx] + [f"g{n_p}"],
+                                  slots.grid, args.patch_px)
                 lo, hi = volume_box_mm(s.affine, s.volume_size)
-                geometry_for_sample(slots.coords_mm(lo, hi), rebuild_views(sub),
-                                    cache, key)
+                geometry_for_sample(
+                    slots.coords_mm(lo, hi),
+                    rebuild_views(sub, token_grid=tuple(args.token_grid),
+                                  patch_px=args.patch_px), cache, key)
         if i % 50 == 0:
             print(f"  [{i}/{len(S)}] {(time.time()-t0)/60:.1f}m", flush=True)
     print(f"cached {len(S)} series -> {cache.root}")
@@ -563,7 +568,7 @@ def cmd_train(args) -> int:
     print(f"{steps} optimiser steps\n")
 
     os.makedirs(args.out, exist_ok=True)
-    step, run = 0, None
+    step, run, n_skip, n_skip_run, n_ok = 0, None, 0, 0, 0
     t0 = time.time()
     for ep in range(args.epochs):
         random.shuffle(tr)
@@ -576,8 +581,18 @@ def cmd_train(args) -> int:
                    else [random.randrange(n_v)])
             try:
                 b = encode_sample(foa, processor, s, slots, cache, args, idx, True)
+                n_skip_run = 0
             except Exception as e:
+                n_skip += 1
+                n_skip_run += 1
                 print(f"  skip {s.patient_id}: {type(e).__name__}: {e}")
+                # A misconfiguration skips *every* sample, and a loop that keeps
+                # going then reports four epochs of training on nothing and
+                # saves a checkpoint. Fail loudly instead.
+                if n_skip_run >= 10:
+                    raise RuntimeError(
+                        f"{n_skip_run} consecutive samples failed to encode -- "
+                        f"this is a configuration error, not bad data. Last: {e}")
                 continue
             tau = temperature_at(step, steps, args.tau_start, args.tau_end)
             log_w = build_log_w(b["w"], temperature=tau)[None].to(
@@ -586,6 +601,7 @@ def cmd_train(args) -> int:
                        b["f12"].to(log_w.dtype), labels=b["labels"]).loss
             (loss / args.grad_accum).backward()
             run = float(loss.detach()) if run is None else 0.98 * run + 0.02 * float(loss.detach())
+            n_ok += 1
 
             if (i + 1) % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -597,6 +613,10 @@ def cmd_train(args) -> int:
                           f"tau {tau:.2f} width {effective_width(log_w.float()):.1f} "
                           f"lr {sched.get_last_lr()[0]:.2e} {el/60:.1f}m "
                           f"eta {(steps-step)*el/max(step,1)/60:.0f}m", flush=True)
+        if n_ok == 0:
+            raise RuntimeError("epoch finished with zero usable samples; refusing "
+                               "to save a checkpoint trained on nothing")
+        print(f"  epoch {ep}: {n_ok} samples used, {n_skip} skipped")
         foa.lm.save_pretrained(os.path.join(args.out, "lora"))
         torch.save({k: v for k, v in foa.state_dict().items()
                     if not k.startswith("lm.")}, os.path.join(args.out, "foa.pt"))
@@ -697,6 +717,10 @@ def main(argv=None) -> int:
         p.add_argument("--uniform-w", action="store_true",
                        help="the ablation: same cost, no geometry")
         if name == "cache":
+            p.add_argument("--token-grid", nargs=2, type=int, required=True,
+                           help="the tower's grid, printed by `train` at startup")
+            p.add_argument("--patch-px", type=int, required=True,
+                           help="14 or 28, also printed by `train` at startup")
             continue
         p.add_argument("--out", default="runs/foa1")
         p.add_argument("--model", default="Qwen/Qwen3-VL-4B-Instruct")
