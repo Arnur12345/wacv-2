@@ -788,12 +788,19 @@ def cmd_probe(args) -> int:
     print(f"  bright COLUMN {c0}: in row-major row-block {cr:6.1%} | "
           f"in row-major col-stride {cc:6.1%}")
 
+    # What discriminates is which hypothesis each stimulus favours, plus at
+    # least one stimulus showing real localisation. Requiring BOTH to be strong
+    # is wrong: a bright vertical stripe overlaps the already-bright mediastinum
+    # and perturbs far less than a horizontal one, so the column test is
+    # inherently the weaker of the two.
     row_major = (rr > rc) and (cc > cr)
     col_major = (rc > rr) and (cr > cc)
-    ok_all = bool(row_major and rr > 2 * base and cc > 2 * base)
+    strong = max(rr, cc) > 2 * base
+    ok_all = bool(row_major and strong)
     print()
     if row_major:
-        print(f"  pattern: ROW-MAJOR (row->block {rr:.1%}, col->stride {cc:.1%})")
+        print(f"  pattern: ROW-MAJOR (row->block {rr:.1%}, col->stride {cc:.1%}); "
+              f"strongest localisation {max(rr, cc) / base:.1f}x uniform")
     elif col_major:
         print("  pattern: COLUMN-MAJOR -- w columns must be transposed")
     else:
