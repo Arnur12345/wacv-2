@@ -733,38 +733,50 @@ def cmd_probe(args) -> int:
         return vision_features(foa.lm, enc["pixel_values"].to(dev, dt),
                                enc["image_grid_thw"].to(dev)).float()
 
-    # Differential probe. ViT features are contextualised and some tokens carry
-    # huge norms regardless of content ("registers"), so an absolute deviation
-    # finds those every time. Subtract the blank-image features and the only
-    # thing left is the response to the square.
+    # A single 14px patch is too weak a stimulus: the differential response is
+    # real but spread over hundreds of tokens, so argmax is noise. Light a whole
+    # ROW and a whole COLUMN instead -- under row-major a bright row lands in one
+    # contiguous block of tokens and a bright column lands in a strided set, and
+    # the two hypotheses predict exactly swapped patterns.
     blank = np.zeros((rows * px, cols * px, 3), np.uint8)
     f0 = feats_of(blank)
 
-    probes = [(0, 1), (1, 0), (rows // 2, cols // 3), (rows - 1, cols - 1)]
-    got_idx = []
-    ok_all = True
-    for (r, c) in probes:
+    def response(mask_fn):
         a = blank.copy()
-        a[r * px:(r + 1) * px, c * px:(c + 1) * px] = 255
-        d = (feats_of(a) - f0).norm(dim=-1)
-        got = int(d.argmax())
-        got_idx.append(got)
-        want_row_major = r * cols + c
-        want_col_major = c * rows + r
-        tag = ("row-major" if got == want_row_major else
-               "COLUMN-MAJOR" if got == want_col_major else "other")
-        share = float(d[got] / d.sum())
-        ok_all &= (got == want_row_major)
-        print(f"  bright patch at (row={r:2d}, col={c:2d}): token {got:4d} "
-              f"(row-major expects {want_row_major:4d}) -> {tag}"
-              f"   [response share {share:.1%}]")
+        mask_fn(a)
+        return (feats_of(a) - f0).norm(dim=-1).cpu().numpy()
 
-    if all(g == got_idx[0] for g in got_idx):
-        print("\n  Every probe picked the same token: the differential response is "
-              "not\n  spatially localised. Patch identity may not survive this "
-              "tower's\n  output; inspect get_image_features before trusting any "
-              "index map.")
-        return 1
+    r0, c0 = rows // 2, cols // 3
+    d_row = response(lambda a: a.__setitem__(
+        (slice(r0 * px, (r0 + 1) * px), slice(None)), 255))
+    d_col = response(lambda a: a.__setitem__(
+        (slice(None), slice(c0 * px, (c0 + 1) * px)), 255))
+
+    idx = np.arange(rows * cols)
+    rm_row = (idx // cols) == r0          # row-major: bright row -> contiguous
+    rm_col = (idx % cols) == c0           # row-major: bright col -> strided
+    def frac(d, m):
+        return float(d[m].sum() / max(d.sum(), 1e-9))
+
+    base = 1.0 / rows                      # share if the response were uniform
+    print(f"  uniform baseline would be {base:.1%} of the response\n")
+    rr, rc = frac(d_row, rm_row), frac(d_row, rm_col)
+    cr, cc = frac(d_col, rm_row), frac(d_col, rm_col)
+    print(f"  bright ROW {r0}:    in row-major row-block {rr:6.1%} | "
+          f"in row-major col-stride {rc:6.1%}")
+    print(f"  bright COLUMN {c0}: in row-major row-block {cr:6.1%} | "
+          f"in row-major col-stride {cc:6.1%}")
+
+    row_major = (rr > rc) and (cc > cr)
+    col_major = (rc > rr) and (cr > cc)
+    ok_all = bool(row_major and rr > 2 * base and cc > 2 * base)
+    print()
+    if row_major:
+        print(f"  pattern: ROW-MAJOR (row->block {rr:.1%}, col->stride {cc:.1%})")
+    elif col_major:
+        print("  pattern: COLUMN-MAJOR -- w columns must be transposed")
+    else:
+        print("  pattern: neither; the tower does not preserve a simple raster order")
 
     print()
     if ok_all:
