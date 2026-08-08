@@ -150,7 +150,8 @@ def volume_box_mm(affine, size) -> Tuple[torch.Tensor, torch.Tensor]:
     return pts.min(dim=0).values, pts.max(dim=0).values
 
 
-def rebuild_views(sample: FOASample, n_views: Optional[int] = None):
+def rebuild_views(sample: FOASample, n_views: Optional[int] = None,
+                  token_grid: Optional[Tuple[int, int]] = None):
     """The exact DRRViews the images were rendered with, at patch=28."""
     from geometry_kernel import DRRView, CTVolume
 
@@ -162,9 +163,12 @@ def rebuild_views(sample: FOASample, n_views: Optional[int] = None):
                      direction=np.eye(3))
     out = []
     for g in sample.view_specs[:n_views or len(sample.view_specs)]:
+        model_hw = (None if token_grid is None
+                    else (token_grid[0] * PATCH_EFFECTIVE,
+                          token_grid[1] * PATCH_EFFECTIVE))
         v = DRRView(dummy, g["source_mm"], g["det_center_mm"], g["det_u"], g["det_v"],
                     det_spacing=tuple(g["det_spacing"]), det_size=tuple(g["det_size"]),
-                    patch=PATCH_EFFECTIVE)
+                    patch=PATCH_EFFECTIVE, model_hw=model_hw)
         out.append(v)
     return out
 
@@ -356,8 +360,17 @@ def build_model(model_id: str, cfg: FOAConfig, rank: int = 16, dtype="bfloat16")
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     td = getattr(torch, dtype)
-    processor = AutoProcessor.from_pretrained(model_id, min_pixels=64 * 28 * 28,
-                                              max_pixels=512 * 512)
+    processor = AutoProcessor.from_pretrained(model_id)
+    # from_pretrained does not reliably forward these to the image processor, so
+    # set them on it directly -- otherwise a 504px DRR is silently upscaled to
+    # 896px and the tower emits 32x32 tokens instead of 18x18.
+    ip = getattr(processor, "image_processor", None)
+    if ip is not None:
+        ip.min_pixels = 64 * 28 * 28
+        ip.max_pixels = 324 * 28 * 28          # 18x18 merged tokens at 504px
+        if isinstance(getattr(ip, "size", None), dict):
+            ip.size = dict(ip.size, shortest_edge=ip.min_pixels,
+                           longest_edge=ip.max_pixels)
     base = AutoModelForImageTextToText.from_pretrained(
         model_id, dtype=td, attn_implementation="sdpa")
 
@@ -370,16 +383,26 @@ def build_model(model_id: str, cfg: FOAConfig, rank: int = 16, dtype="bfloat16")
         task_type="CAUSAL_LM", target_modules=lora_targets(base)))
 
     lm_dim = base.get_input_embeddings().weight.shape[1]
-    patch_dim = _probe_patch_dim(base, processor, td)
+    patch_dim, token_grid = _probe_tower(base, processor, td)
     foa = FOA(base, patch_dim=patch_dim, lm_dim=lm_dim, cfg=cfg)
+    foa.token_grid = token_grid
     foa.to("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  lm_dim={lm_dim} patch_dim={patch_dim} "
+          f"token grid {token_grid[0]}x{token_grid[1]} = "
+          f"{token_grid[0]*token_grid[1]} per view | "
           f"trainable={sum(p.numel() for p in foa.parameters() if p.requires_grad):,}")
     return foa, processor
 
 
-def _probe_patch_dim(model, processor, td) -> int:
-    """One forward through the tower to learn its output width and token count."""
+def _probe_tower(model, processor, td):
+    """
+    One forward through the tower to learn its output width and TOKEN GRID.
+
+    The grid is read from the processor rather than assumed: `image_grid_thw`
+    is in pre-merge 14px patch units, so the merged grid is (h//2, w//2). Views
+    are then built to match whatever the tower actually did, which is the only
+    way this cannot silently disagree.
+    """
     from PIL import Image
 
     img = Image.fromarray(np.zeros((504, 504, 3), np.uint8))
@@ -388,8 +411,13 @@ def _probe_patch_dim(model, processor, td) -> int:
     with torch.no_grad():
         f = vision_features(model, enc["pixel_values"].to(dev, td),
                             enc["image_grid_thw"].to(dev))
-    check_alignment(324, f.shape[0], 1)
-    return int(f.shape[-1])
+    t_, h, w = [int(x) for x in enc["image_grid_thw"][0]]
+    grid = (h // 2, w // 2)
+    n = grid[0] * grid[1]
+    if n != f.shape[0]:
+        raise ValueError(f"grid {grid} implies {n} tokens but the tower emitted "
+                         f"{f.shape[0]}; the merge factor is not 2x2 here")
+    return int(f.shape[-1]), grid
 
 
 def vision_features(model, pixel_values, image_grid_thw) -> torch.Tensor:
@@ -457,7 +485,8 @@ def encode_sample(foa, processor, s: FOASample, slots: SlotGrid, cache, args,
     views = rebuild_views(sub)
     lo, hi = volume_box_mm(s.affine, s.volume_size)
     slot_mm = slots.coords_mm(lo, hi)
-    key = w_cache_key(s.series_uid, key_views, slots.grid, PATCH_EFFECTIVE)
+    key = w_cache_key(s.series_uid, key_views + [f"g{views[0].grid.n_patches}"],
+                      slots.grid, PATCH_EFFECTIVE)
     w, f12 = geometry_for_sample(slot_mm, views, cache, key)
     w = w.double()
     if args.uniform_w:
