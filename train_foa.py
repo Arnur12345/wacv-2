@@ -738,8 +738,20 @@ def cmd_probe(args) -> int:
     # ROW and a whole COLUMN instead -- under row-major a bright row lands in one
     # contiguous block of tokens and a bright column lands in a strided set, and
     # the two hypotheses predict exactly swapped patterns.
-    blank = np.zeros((rows * px, cols * px, 3), np.uint8)
+    # Build the stimulus at the DETECTOR size, not at rows*px. rows*px is the
+    # size after the processor's resize; feeding that back in gets resized
+    # again (504 -> 30x30 tokens, but 420 -> 26x26), so the grid would not match
+    # the one the real DRRs produce.
+    S0 = load_samples(args.data, args.landmark, args.views)
+    det = S0[0].view_specs[0]["det_size"] if S0 else [504, 504]
+    H, W = int(det[1]), int(det[0])
+    blank = np.zeros((H, W, 3), np.uint8)
     f0 = feats_of(blank)
+    if f0.shape[0] != rows * cols:
+        raise ValueError(f"a {W}x{H} image gives {f0.shape[0]} tokens but the "
+                         f"probe expected {rows*cols} ({rows}x{cols}); the "
+                         f"processor is resizing inconsistently")
+    print(f"  stimulus at the detector size {W}x{H} -> {f0.shape[0]} tokens")
 
     def response(mask_fn):
         a = blank.copy()
@@ -747,10 +759,14 @@ def cmd_probe(args) -> int:
         return (feats_of(a) - f0).norm(dim=-1).cpu().numpy()
 
     r0, c0 = rows // 2, cols // 3
+    # token row/col -> source pixel span, the same proportional mapping PatchGrid
+    # uses when the model resolution differs from the detector
+    ry0, ry1 = int(r0 / rows * H), int((r0 + 1) / rows * H)
+    cx0, cx1 = int(c0 / cols * W), int((c0 + 1) / cols * W)
     d_row = response(lambda a: a.__setitem__(
-        (slice(r0 * px, (r0 + 1) * px), slice(None)), 255))
+        (slice(ry0, ry1), slice(None)), 255))
     d_col = response(lambda a: a.__setitem__(
-        (slice(None), slice(c0 * px, (c0 + 1) * px)), 255))
+        (slice(None), slice(cx0, cx1)), 255))
 
     idx = np.arange(rows * cols)
     rm_row = (idx // cols) == r0          # row-major: bright row -> contiguous
