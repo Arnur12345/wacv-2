@@ -1,0 +1,221 @@
+nohup: ignoring input
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+train 701 / val 139 series, target=lung_apex_left, uniform_w=False
+Loading weights:   0%|          | 0/713 [00:00<?, ?it/s]Loading weights:  72%|███████▏  | 516/713 [00:00<00:00, 5109.90it/s]Loading weights: 100%|██████████| 713/713 [00:00<00:00, 4739.15it/s]
+  lm_dim=2560 patch_dim=1024 token grid 30x30 = 900 per view at 14px | trainable=40,143,168
+696 optimiser steps
+
+  ep0 step 10/696 loss 1.2187 tau 4.00 width 36.8 lr 4.66e-05 0.6m eta 41m
+  ep0 step 20/696 loss 0.9318 tau 3.99 width 36.9 lr 1.31e-04 1.2m eta 39m
+  ep0 step 30/696 loss 0.8499 tau 3.99 width 18.5 lr 1.94e-04 1.7m eta 38m
+  ep0 step 40/696 loss 0.8250 tau 3.98 width 36.7 lr 2.00e-04 2.3m eta 38m
+  ep0 step 50/696 loss 0.8219 tau 3.96 width 18.4 lr 2.00e-04 2.9m eta 37m
+  ep0 step 60/696 loss 0.8209 tau 3.95 width 36.5 lr 1.99e-04 3.4m eta 36m
+  ep0 step 70/696 loss 0.8244 tau 3.93 width 18.3 lr 1.99e-04 4.0m eta 36m
+  ep0 step 80/696 loss 0.8053 tau 3.91 width 18.2 lr 1.98e-04 4.5m eta 35m
+  epoch 0: 701 samples used, 0 skipped
+  epoch 0 saved -> runs/foa
+  ep1 step 90/696 loss 0.8056 tau 3.88 width 36.3 lr 1.96e-04 5.1m eta 35m
+  ep1 step 100/696 loss 0.8082 tau 3.85 width 36.1 lr 1.95e-04 5.7m eta 34m
+  ep1 step 110/696 loss 0.8111 tau 3.82 width 18.1 lr 1.94e-04 6.3m eta 33m
+  ep1 step 120/696 loss 0.7987 tau 3.79 width 36.0 lr 1.92e-04 6.8m eta 33m
+  ep1 step 130/696 loss 0.8006 tau 3.75 width 35.8 lr 1.90e-04 7.4m eta 32m
+  ep1 step 140/696 loss 0.7806 tau 3.71 width 17.9 lr 1.88e-04 8.0m eta 32m
+  ep1 step 150/696 loss 0.7950 tau 3.67 width 17.7 lr 1.85e-04 8.5m eta 31m
+  ep1 step 160/696 loss 0.8085 tau 3.63 width 35.3 lr 1.83e-04 9.1m eta 30m
+  ep1 step 170/696 loss 0.8052 tau 3.58 width 35.2 lr 1.80e-04 9.6m eta 30m
+  epoch 1: 1402 samples used, 0 skipped
+  epoch 1 saved -> runs/foa
+  ep2 step 180/696 loss 0.8045 tau 3.54 width 34.8 lr 1.77e-04 10.2m eta 29m
+  ep2 step 190/696 loss 0.7919 tau 3.49 width 17.3 lr 1.74e-04 10.8m eta 29m
+  ep2 step 200/696 loss 0.7903 tau 3.43 width 17.1 lr 1.70e-04 11.4m eta 28m
+  ep2 step 210/696 loss 0.7832 tau 3.38 width 16.9 lr 1.67e-04 11.9m eta 28m
+  ep2 step 220/696 loss 0.7893 tau 3.32 width 33.7 lr 1.63e-04 12.5m eta 27m
+  ep2 step 230/696 loss 0.7964 tau 3.27 width 33.5 lr 1.60e-04 13.0m eta 26m
+  ep2 step 240/696 loss 0.7860 tau 3.21 width 16.5 lr 1.56e-04 13.6m eta 26m
+  ep2 step 250/696 loss 0.7894 tau 3.15 width 16.3 lr 1.52e-04 14.2m eta 25m
+  ep2 step 260/696 loss 0.7822 tau 3.08 width 32.3 lr 1.48e-04 14.7m eta 25m
+  epoch 2: 2103 samples used, 0 skipped
+  epoch 2 saved -> runs/foa
+  ep3 step 270/696 loss 0.7808 tau 3.02 width 16.0 lr 1.43e-04 15.3m eta 24m
+  ep3 step 280/696 loss 0.7719 tau 2.96 width 15.8 lr 1.39e-04 15.9m eta 24m
+  ep3 step 290/696 loss 0.7871 tau 2.89 width 15.6 lr 1.35e-04 16.4m eta 23m
+  ep3 step 300/696 loss 0.7776 tau 2.83 width 30.6 lr 1.30e-04 17.0m eta 22m
+  ep3 step 310/696 loss 0.7786 tau 2.76 width 30.1 lr 1.26e-04 17.5m eta 22m
+  ep3 step 320/696 loss 0.7787 tau 2.69 width 29.6 lr 1.21e-04 18.1m eta 21m
+  ep3 step 330/696 loss 0.7849 tau 2.63 width 14.5 lr 1.16e-04 18.7m eta 21m
+  ep3 step 340/696 loss 0.7628 tau 2.56 width 14.3 lr 1.12e-04 19.2m eta 20m
+  epoch 3: 2804 samples used, 0 skipped
+  epoch 3 saved -> runs/foa
+  ep4 step 350/696 loss 0.7706 tau 2.49 width 14.1 lr 1.07e-04 19.8m eta 20m
+  ep4 step 360/696 loss 0.7523 tau 2.42 width 27.5 lr 1.02e-04 20.4m eta 19m
+  ep4 step 370/696 loss 0.7567 tau 2.35 width 26.9 lr 9.73e-05 20.9m eta 18m
+  ep4 step 380/696 loss 0.7575 tau 2.29 width 26.3 lr 9.26e-05 21.5m eta 18m
+  ep4 step 390/696 loss 0.7651 tau 2.22 width 25.7 lr 8.79e-05 22.1m eta 17m
+  ep4 step 400/696 loss 0.7628 tau 2.15 width 25.1 lr 8.32e-05 22.6m eta 17m
+  ep4 step 410/696 loss 0.7620 tau 2.09 width 12.2 lr 7.85e-05 23.2m eta 16m
+  ep4 step 420/696 loss 0.7523 tau 2.02 width 23.9 lr 7.39e-05 23.7m eta 16m
+  ep4 step 430/696 loss 0.7552 tau 1.96 width 11.6 lr 6.93e-05 24.3m eta 15m
+  epoch 4: 3505 samples used, 0 skipped
+  epoch 4 saved -> runs/foa
+  ep5 step 440/696 loss 0.7289 tau 1.90 width 22.6 lr 6.48e-05 24.9m eta 14m
+  ep5 step 450/696 loss 0.7105 tau 1.84 width 11.0 lr 6.04e-05 25.4m eta 14m
+  ep5 step 460/696 loss 0.6906 tau 1.78 width 10.7 lr 5.61e-05 26.0m eta 13m
+  ep5 step 470/696 loss 0.7037 tau 1.72 width 10.3 lr 5.19e-05 26.5m eta 13m
+  ep5 step 480/696 loss 0.6986 tau 1.66 width 10.0 lr 4.78e-05 27.1m eta 12m
+  ep5 step 490/696 loss 0.6894 tau 1.60 width 19.4 lr 4.38e-05 27.7m eta 12m
+  ep5 step 500/696 loss 0.6958 tau 1.55 width 18.8 lr 3.99e-05 28.2m eta 11m
+  ep5 step 510/696 loss 0.7040 tau 1.50 width 18.3 lr 3.62e-05 28.8m eta 10m
+  ep5 step 520/696 loss 0.7123 tau 1.45 width 8.8 lr 3.26e-05 29.3m eta 10m
+  epoch 5: 4206 samples used, 0 skipped
+  epoch 5 saved -> runs/foa
+  ep6 step 530/696 loss 0.6674 tau 1.40 width 8.6 lr 2.92e-05 29.9m eta 9m
+  ep6 step 540/696 loss 0.6153 tau 1.36 width 16.6 lr 2.59e-05 30.5m eta 9m
+  ep6 step 550/696 loss 0.6257 tau 1.31 width 16.1 lr 2.28e-05 31.1m eta 8m
+  ep6 step 560/696 loss 0.6324 tau 1.27 width 7.8 lr 1.99e-05 31.6m eta 8m
+  ep6 step 570/696 loss 0.6209 tau 1.24 width 15.2 lr 1.71e-05 32.2m eta 7m
+  ep6 step 580/696 loss 0.6041 tau 1.20 width 7.4 lr 1.46e-05 32.7m eta 7m
+  ep6 step 590/696 loss 0.6043 tau 1.17 width 14.4 lr 1.22e-05 33.3m eta 6m
+  ep6 step 600/696 loss 0.6065 tau 1.14 width 7.0 lr 1.00e-05 33.8m eta 5m
+  epoch 6: 4907 samples used, 0 skipped
+  epoch 6 saved -> runs/foa
+  ep7 step 610/696 loss 0.5980 tau 1.11 width 13.7 lr 8.05e-06 34.4m eta 5m
+  ep7 step 620/696 loss 0.5720 tau 1.09 width 13.4 lr 6.28e-06 35.0m eta 4m
+  ep7 step 630/696 loss 0.5712 tau 1.07 width 13.1 lr 4.73e-06 35.6m eta 4m
+  ep7 step 640/696 loss 0.5569 tau 1.05 width 12.9 lr 3.40e-06 36.1m eta 3m
+  ep7 step 650/696 loss 0.5541 tau 1.03 width 12.7 lr 2.28e-06 36.7m eta 3m
+  ep7 step 660/696 loss 0.5589 tau 1.02 width 12.6 lr 1.38e-06 37.2m eta 2m
+  ep7 step 670/696 loss 0.5662 tau 1.01 width 12.5 lr 7.05e-07 37.8m eta 1m
+  ep7 step 680/696 loss 0.5522 tau 1.00 width 6.2 lr 2.55e-07 38.3m eta 1m
+  ep7 step 690/696 loss 0.5616 tau 1.00 width 12.3 lr 2.90e-08 38.9m eta 0m
+  epoch 7: 5608 samples used, 0 skipped
+  epoch 7 saved -> runs/foa
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+train 701 / val 139 series, target=lung_apex_left, uniform_w=True
+Loading weights:   0%|          | 0/713 [00:00<?, ?it/s]Loading weights:  43%|████▎     | 304/713 [00:00<00:00, 3029.51it/s]Loading weights:  85%|████████▌ | 607/713 [00:00<00:00, 2970.55it/s]Loading weights: 100%|██████████| 713/713 [00:00<00:00, 3078.81it/s]
+  lm_dim=2560 patch_dim=1024 token grid 30x30 = 900 per view at 14px | trainable=40,143,168
+696 optimiser steps
+
+  ep0 step 10/696 loss 1.2244 tau 4.00 width 1800.0 lr 4.66e-05 0.6m eta 41m
+  ep0 step 20/696 loss 0.9318 tau 3.99 width 1800.0 lr 1.31e-04 1.1m eta 38m
+  ep0 step 30/696 loss 0.8444 tau 3.99 width 900.0 lr 1.94e-04 1.7m eta 37m
+  ep0 step 40/696 loss 0.8277 tau 3.98 width 1800.0 lr 2.00e-04 2.2m eta 37m
+  ep0 step 50/696 loss 3.5130 tau 3.96 width 900.0 lr 2.00e-04 2.8m eta 36m
+  ep0 step 60/696 loss 1.4127 tau 3.95 width 1800.0 lr 1.99e-04 3.3m eta 35m
+  ep0 step 70/696 loss 0.9449 tau 3.93 width 900.0 lr 1.99e-04 3.9m eta 35m
+  ep0 step 80/696 loss 0.8314 tau 3.91 width 900.0 lr 1.98e-04 4.4m eta 34m
+  epoch 0: 701 samples used, 0 skipped
+  epoch 0 saved -> runs/uniform
+  ep1 step 90/696 loss 0.8115 tau 3.88 width 1800.0 lr 1.96e-04 5.0m eta 34m
+  ep1 step 100/696 loss 0.8117 tau 3.85 width 1800.0 lr 1.95e-04 5.6m eta 33m
+  ep1 step 110/696 loss 0.8136 tau 3.82 width 900.0 lr 1.94e-04 6.1m eta 33m
+  ep1 step 120/696 loss 0.8013 tau 3.79 width 1800.0 lr 1.92e-04 6.7m eta 32m
+  ep1 step 130/696 loss 0.7994 tau 3.75 width 1800.0 lr 1.90e-04 7.2m eta 31m
+  ep1 step 140/696 loss 0.7846 tau 3.71 width 900.0 lr 1.88e-04 7.8m eta 31m
+  ep1 step 150/696 loss 0.7986 tau 3.67 width 900.0 lr 1.85e-04 8.3m eta 30m
+  ep1 step 160/696 loss 0.8100 tau 3.63 width 1800.0 lr 1.83e-04 8.9m eta 30m
+  ep1 step 170/696 loss 0.8055 tau 3.58 width 1800.0 lr 1.80e-04 9.4m eta 29m
+  epoch 1: 1402 samples used, 0 skipped
+  epoch 1 saved -> runs/uniform
+  ep2 step 180/696 loss 0.8047 tau 3.54 width 1800.0 lr 1.77e-04 10.0m eta 29m
+  ep2 step 190/696 loss 0.7898 tau 3.49 width 900.0 lr 1.74e-04 10.6m eta 28m
+  ep2 step 200/696 loss 0.7901 tau 3.43 width 900.0 lr 1.70e-04 11.1m eta 28m
+  ep2 step 210/696 loss 0.7827 tau 3.38 width 900.0 lr 1.67e-04 11.7m eta 27m
+  ep2 step 220/696 loss 0.7900 tau 3.32 width 1800.0 lr 1.63e-04 12.2m eta 26m
+  ep2 step 230/696 loss 0.7993 tau 3.27 width 1800.0 lr 1.60e-04 12.8m eta 26m
+  ep2 step 240/696 loss 0.7863 tau 3.21 width 900.0 lr 1.56e-04 13.3m eta 25m
+  ep2 step 250/696 loss 0.7900 tau 3.15 width 900.0 lr 1.52e-04 13.9m eta 25m
+  ep2 step 260/696 loss 0.7827 tau 3.08 width 1800.0 lr 1.48e-04 14.4m eta 24m
+  epoch 2: 2103 samples used, 0 skipped
+  epoch 2 saved -> runs/uniform
+  ep3 step 270/696 loss 0.7779 tau 3.02 width 900.0 lr 1.43e-04 15.0m eta 24m
+  ep3 step 280/696 loss 0.7736 tau 2.96 width 900.0 lr 1.39e-04 15.6m eta 23m
+  ep3 step 290/696 loss 0.7897 tau 2.89 width 900.0 lr 1.35e-04 16.1m eta 23m
+  ep3 step 300/696 loss 0.7789 tau 2.83 width 1800.0 lr 1.30e-04 16.7m eta 22m
+  ep3 step 310/696 loss 0.7763 tau 2.76 width 1800.0 lr 1.26e-04 17.2m eta 21m
+  ep3 step 320/696 loss 0.7813 tau 2.69 width 1800.0 lr 1.21e-04 17.8m eta 21m
+  ep3 step 330/696 loss 0.7855 tau 2.63 width 900.0 lr 1.16e-04 18.3m eta 20m
+  ep3 step 340/696 loss 0.7659 tau 2.56 width 900.0 lr 1.12e-04 18.9m eta 20m
+  epoch 3: 2804 samples used, 0 skipped
+  epoch 3 saved -> runs/uniform
+  ep4 step 350/696 loss 0.7736 tau 2.49 width 900.0 lr 1.07e-04 19.5m eta 19m
+  ep4 step 360/696 loss 0.7564 tau 2.42 width 1800.0 lr 1.02e-04 20.0m eta 19m
+  ep4 step 370/696 loss 0.7595 tau 2.35 width 1800.0 lr 9.73e-05 20.6m eta 18m
+  ep4 step 380/696 loss 0.7619 tau 2.29 width 1800.0 lr 9.26e-05 21.1m eta 18m
+  ep4 step 390/696 loss 0.7676 tau 2.22 width 1800.0 lr 8.79e-05 21.7m eta 17m
+  ep4 step 400/696 loss 0.7668 tau 2.15 width 1800.0 lr 8.32e-05 22.2m eta 16m
+  ep4 step 410/696 loss 0.7653 tau 2.09 width 900.0 lr 7.85e-05 22.8m eta 16m
+  ep4 step 420/696 loss 0.7507 tau 2.02 width 1800.0 lr 7.39e-05 23.3m eta 15m
+  ep4 step 430/696 loss 0.7590 tau 1.96 width 900.0 lr 6.93e-05 23.9m eta 15m
+  epoch 4: 3505 samples used, 0 skipped
+  epoch 4 saved -> runs/uniform
+  ep5 step 440/696 loss 0.7308 tau 1.90 width 1800.0 lr 6.48e-05 24.5m eta 14m
+  ep5 step 450/696 loss 0.7149 tau 1.84 width 900.0 lr 6.04e-05 25.0m eta 14m
+  ep5 step 460/696 loss 0.6923 tau 1.78 width 900.0 lr 5.61e-05 25.6m eta 13m
+  ep5 step 470/696 loss 0.7076 tau 1.72 width 900.0 lr 5.19e-05 26.1m eta 13m
+  ep5 step 480/696 loss 0.7070 tau 1.66 width 900.0 lr 4.78e-05 26.7m eta 12m
+  ep5 step 490/696 loss 0.6979 tau 1.60 width 1800.0 lr 4.38e-05 27.2m eta 11m
+  ep5 step 500/696 loss 0.6992 tau 1.55 width 1800.0 lr 3.99e-05 27.8m eta 11m
+  ep5 step 510/696 loss 0.7044 tau 1.50 width 1800.0 lr 3.62e-05 28.3m eta 10m
+  ep5 step 520/696 loss 0.7070 tau 1.45 width 900.0 lr 3.26e-05 28.9m eta 10m
+  epoch 5: 4206 samples used, 0 skipped
+  epoch 5 saved -> runs/uniform
+  ep6 step 530/696 loss 0.6524 tau 1.40 width 900.0 lr 2.92e-05 29.5m eta 9m
+  ep6 step 540/696 loss 0.6143 tau 1.36 width 1800.0 lr 2.59e-05 30.0m eta 9m
+  ep6 step 550/696 loss 0.6177 tau 1.31 width 1800.0 lr 2.28e-05 30.6m eta 8m
+  ep6 step 560/696 loss 0.6185 tau 1.27 width 900.0 lr 1.99e-05 31.1m eta 8m
+  ep6 step 570/696 loss 0.6243 tau 1.24 width 1800.0 lr 1.71e-05 31.7m eta 7m
+  ep6 step 580/696 loss 0.6041 tau 1.20 width 900.0 lr 1.46e-05 32.2m eta 6m
+  ep6 step 590/696 loss 0.6049 tau 1.17 width 1800.0 lr 1.22e-05 32.8m eta 6m
+  ep6 step 600/696 loss 0.5998 tau 1.14 width 900.0 lr 1.00e-05 33.3m eta 5m
+  epoch 6: 4907 samples used, 0 skipped
+  epoch 6 saved -> runs/uniform
+  ep7 step 610/696 loss 0.5946 tau 1.11 width 1800.0 lr 8.05e-06 33.9m eta 5m
+  ep7 step 620/696 loss 0.5613 tau 1.09 width 1800.0 lr 6.28e-06 34.5m eta 4m
+  ep7 step 630/696 loss 0.5690 tau 1.07 width 1800.0 lr 4.73e-06 35.0m eta 4m
+  ep7 step 640/696 loss 0.5527 tau 1.05 width 1800.0 lr 3.40e-06 35.6m eta 3m
+  ep7 step 650/696 loss 0.5442 tau 1.03 width 1800.0 lr 2.28e-06 36.1m eta 3m
+  ep7 step 660/696 loss 0.5430 tau 1.02 width 1800.0 lr 1.38e-06 36.7m eta 2m
+  ep7 step 670/696 loss 0.5623 tau 1.01 width 1800.0 lr 7.05e-07 37.2m eta 1m
+  ep7 step 680/696 loss 0.5424 tau 1.00 width 900.0 lr 2.55e-07 37.8m eta 1m
+  ep7 step 690/696 loss 0.5556 tau 1.00 width 1800.0 lr 2.90e-08 38.3m eta 0m
+  epoch 7: 5608 samples used, 0 skipped
+  epoch 7 saved -> runs/uniform
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+eval 154 series on split=test
+
+Loading weights:   0%|          | 0/713 [00:00<?, ?it/s]Loading weights:  53%|█████▎    | 375/713 [00:00<00:00, 3715.51it/s]Loading weights: 100%|██████████| 713/713 [00:00<00:00, 3693.58it/s]
+  lm_dim=2560 patch_dim=1024 token grid 30x30 = 900 per view at 14px | trainable=40,143,168
+  loaded FOA head from runs/foa
+  1view-pa: 154 ok, 0 failed
+  1view-lat: 154 ok, 0 failed
+  2view: 154 ok, 0 failed
+
+  condition              n       R           95% CI   along   cross  align  med err
+  ------------------------------------------------------------------------------
+  1view-pa             154   0.349 [ 0.268, 0.499]   96.52  276.68  0.135   117.93
+  1view-lat            154   0.146 [ 0.127, 0.168]   41.06  281.78  0.081   117.93
+  2view                154   0.349 [ 0.268, 0.499]   96.52  276.68  0.135   117.93
+
+-> runs/foa/e1.json
+
+Registered predictions (docs/E1_PREREGISTRATION.md): single-view R > 1, two-view R -> 1, alignment > 0.8 for single views.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+eval 154 series on split=test
+
+Loading weights:   0%|          | 0/713 [00:00<?, ?it/s]Loading weights:  42%|████▏     | 302/713 [00:00<00:00, 3019.47it/s]Loading weights:  88%|████████▊ | 627/713 [00:00<00:00, 3153.30it/s]Loading weights: 100%|██████████| 713/713 [00:00<00:00, 3252.10it/s]
+  lm_dim=2560 patch_dim=1024 token grid 30x30 = 900 per view at 14px | trainable=40,143,168
+  loaded FOA head from runs/uniform
+  1view-pa: 154 ok, 0 failed
+  1view-lat: 154 ok, 0 failed
+  2view: 154 ok, 0 failed
+
+  condition              n       R           95% CI   along   cross  align  med err
+  ------------------------------------------------------------------------------
+  1view-pa             154   0.349 [ 0.268, 0.499]   96.52  276.68  0.135   117.93
+  1view-lat            154   0.146 [ 0.127, 0.168]   41.06  281.78  0.081   117.93
+  2view                154   0.349 [ 0.268, 0.499]   96.52  276.68  0.135   117.93
+
+-> runs/uniform/e1.json
+
+Registered predictions (docs/E1_PREREGISTRATION.md): single-view R > 1, two-view R -> 1, alignment > 0.8 for single views.

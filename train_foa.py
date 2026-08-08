@@ -642,10 +642,39 @@ def cmd_eval(args) -> int:
                     n_heads=args.heads)
     foa, processor = build_model(args.model, cfg, rank=args.rank)
     if args.adapter:
-        from peft import PeftModel
+        # The LoRA lives in <adapter>/lora and the FOA head in <adapter>/foa.pt.
+        # An earlier version loaded only the head, so eval ran against a freshly
+        # initialised adapter and every run produced the same constant.
+        from peft import set_peft_model_state_dict
+        lora_dir = os.path.join(args.adapter, "lora")
+        loaded = False
+        for fn, ld in (("adapter_model.safetensors", None),
+                       ("adapter_model.bin", torch.load)):
+            p = os.path.join(lora_dir, fn)
+            if not os.path.exists(p):
+                continue
+            if ld is None:
+                from safetensors.torch import load_file
+                sd_l = load_file(p)
+            else:
+                sd_l = ld(p, map_location="cpu")
+            res = set_peft_model_state_dict(foa.lm, sd_l)
+            loaded = True
+            print(f"  loaded LoRA from {p} "
+                  f"({len(sd_l)} tensors, unexpected={len(getattr(res, 'unexpected_keys', []) or [])})")
+            break
+        if not loaded:
+            raise FileNotFoundError(f"no LoRA weights under {lora_dir}")
+
         sd = torch.load(os.path.join(args.adapter, "foa.pt"), map_location="cpu")
-        foa.load_state_dict(sd, strict=False)
-        print(f"  loaded FOA head from {args.adapter}")
+        missing, unexpected = foa.load_state_dict(sd, strict=False)
+        head_keys = [k for k in sd if k.startswith(("slots.", "gather.", "project.",
+                                                    "nullspace."))]
+        print(f"  loaded FOA head: {len(head_keys)} tensors, "
+              f"{len([m for m in missing if not m.startswith('lm.')])} missing")
+        pn = float(foa.project.weight.norm())
+        print(f"  |project.weight| = {pn:.4f}"
+              + ("   <-- STILL ZERO: the head never trained" if pn < 1e-6 else ""))
     foa.eval()
     cache = WCache(os.path.join(args.data, "wcache"))
 
@@ -693,6 +722,16 @@ def cmd_eval(args) -> int:
             results[cname] = m
         print(f"  {cname}: {len(errs)} ok, {n_fail} failed", flush=True)
 
+    # A model that ignores the image produces the same answer every time, and
+    # every conditional comparison downstream then compares nothing.
+    for cname in list(results):
+        preds = [tuple(r["pred"]) for r in records if r["condition"] == cname]
+        uniq = len(set(preds))
+        results[cname]["unique_predictions"] = uniq
+        if uniq <= max(2, len(preds) // 50):
+            print(f"  WARNING {cname}: only {uniq} distinct predictions over "
+                  f"{len(preds)} samples -- the model is emitting a constant, so "
+                  f"these numbers describe a prior, not a localisation.")
     print("\n" + compare(results))
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "e1.json"), "w") as f:
