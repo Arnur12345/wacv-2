@@ -751,7 +751,14 @@ def cmd_eval(args) -> int:
             print(f"  WARNING {cname}: only {uniq} distinct predictions over "
                   f"{len(preds)} samples -- the model is emitting a constant, so "
                   f"these numbers describe a prior, not a localisation.")
-    print("\n" + compare(results))
+    # dR is the registered quantity: the prior cannot produce a nonzero one,
+    # because its prediction does not depend on the view set.
+    if "1view-pa" in results and "2view" in results:
+        dR = results["1view-pa"]["R"] - results["2view"]["R"]
+        results["_dR"] = dR
+        print(f"\n  dR = R(1view-pa) - R(2view) = {dR:+.3f}"
+              f"   [registered prediction: > 0; prior-only gives exactly 0]")
+    print("\n" + compare({k: v for k, v in results.items() if not k.startswith("_")}))
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "e1.json"), "w") as f:
         json.dump(dict(results={k: {kk: vv for kk, vv in v.items()}

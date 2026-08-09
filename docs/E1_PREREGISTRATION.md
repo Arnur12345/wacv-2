@@ -123,4 +123,51 @@ by eye, and quantify the contamination rate.
 
 ## 8. Changes after registration
 
-None yet.
+### 2026-08-10 -- the absolute thresholds are not discriminative; replaced by a
+### differential form. Made BEFORE any trained model was evaluated in this frame.
+
+Two measurements forced this, both from baselines rather than from results:
+
+**(a) Absolute LPS carried the scanner table offset.** Target SD was 22 / 82 /
+**469** mm; the z spread is where the patient lay on the table, is not present
+in a DRR, and cannot be inferred from one. It dominated the error and therefore
+dominated R. Targets are now predicted relative to the volume centre and
+converted back to absolute mm for scoring, so every error and ray stays in
+millimetres while the nuisance variable is gone.
+
+**(b) In that corrected frame, prior-only satisfies the registered prediction.**
+Predicting the training-set mean, with no image at all:
+
+| condition | R | alignment | median error |
+|---|---|---|---|
+| 1view-pa | **1.988** | **0.941** | 34.74 mm |
+| 1view-lat | 0.699 | 0.272 | 34.74 mm |
+| 2view | **1.988** | **0.941** | 34.74 mm |
+
+"Single-view R > 1 with alignment > 0.8" is therefore satisfied by a model that
+ignores the images. As registered, the prediction could not have failed for the
+right reason, so it is not evidence of anything.
+
+**The replacement, which the prior structurally cannot satisfy.** The prior's
+`2view` R equals its `1view-pa` R exactly, because its prediction does not
+depend on the view set -- only the reference ray changes. So the claim becomes a
+*difference*:
+
+    dR = R(1view-pa) - R(2view)
+
+| | prediction |
+|---|---|
+| FOA | **dR > 0** -- adding an orthogonal view reduces elongation along the first ray |
+| prior-only | **dR = 0** (structural) |
+| silhouette-only | **dR = 0** |
+| uniform w | dR reported; no prediction registered |
+
+Falsified if dR <= 0 for the trained model, or if dR is within the bootstrap CI
+of zero, or if any image-blind baseline shows dR != 0 (which would mean dR
+tracks something other than the view set).
+
+Secondary, still registered: median error must beat prior-only's **34.74 mm**.
+A model that does not beat the prior has not localised anything, whatever its R.
+
+Unchanged: the metric definition in section 2, the conditions in section 3, the
+baselines in section 3, and per-class reporting.
