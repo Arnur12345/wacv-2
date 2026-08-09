@@ -139,6 +139,19 @@ def load_samples(data_dir: str, landmark: str, views: Sequence[str] = ("PA", "LA
     return out
 
 
+def volume_center_mm(sample: "FOASample") -> torch.Tensor:
+    """
+    The frame everything is expressed in.
+
+    Absolute LPS carries the scanner's table offset (target SD in z was 469mm
+    against 22mm in x); it is not visible in a DRR and no model can recover it.
+    Predicting relative to the volume centre removes that nuisance while leaving
+    every error and every ray in millimetres.
+    """
+    lo, hi = volume_box_mm(sample.affine, sample.volume_size)
+    return (lo + hi) / 2
+
+
 def volume_box_mm(affine, size) -> Tuple[torch.Tensor, torch.Tensor]:
     """The volume's mm bounding box, from the affine alone -- no CT loaded."""
     A = torch.tensor(affine, dtype=torch.float64)
@@ -494,9 +507,11 @@ def encode_sample(foa, processor, s: FOASample, slots: SlotGrid, cache, args,
                           patch_px=getattr(foa, "patch_px", PATCH_EFFECTIVE))
     lo, hi = volume_box_mm(s.affine, s.volume_size)
     slot_mm = slots.coords_mm(lo, hi)
-    key = w_cache_key(s.series_uid, key_views + [f"g{views[0].grid.n_patches}"],
+    key = w_cache_key(s.series_uid,
+                      key_views + [f"g{views[0].grid.n_patches}", "relv2"],
                       slots.grid, views[0].patch)
-    w, f12 = geometry_for_sample(slot_mm, views, cache, key)
+    w, f12 = geometry_for_sample(slot_mm, views, cache, key,
+                                 center_mm=(lo + hi) / 2)
     w = w.double()
     if args.uniform_w:
         w = torch.ones_like(w)
@@ -505,7 +520,8 @@ def encode_sample(foa, processor, s: FOASample, slots: SlotGrid, cache, args,
     pre, suf = prompt_ids(processor, s.target_name, dev)
     labels = None
     if train:
-        ans = format_mm(s.target_mm) + (processor.tokenizer.eos_token or "")
+        rel = np.array(s.target_mm) - volume_center_mm(s).numpy()
+        ans = format_mm(rel) + (processor.tokenizer.eos_token or "")
         ans_ids = processor.tokenizer(ans, add_special_tokens=False,
                                       return_tensors="pt").input_ids.to(dev)
         suf = torch.cat([suf, ans_ids], dim=1)
@@ -709,6 +725,9 @@ def cmd_eval(args) -> int:
             if p is None:
                 n_fail += 1
                 continue
+            # the model answers in the volume-relative frame; restore absolute
+            # LPS so errors and rays stay in one coordinate system
+            p = tuple(np.array(p) + volume_center_mm(s).numpy())
             e = np.array(p) - np.array(s.target_mm)
             src = np.array([float(x) for x in b["views"][0].source_mm])
             errs.append(e); rays.append(np.array(s.target_mm) - src)
@@ -875,11 +894,16 @@ def cmd_baseline(args) -> int:
     if not tr or not te:
         print("need both train and eval splits"); return 1
 
-    T = np.array([s.target_mm for s in tr])
+    A = np.array([s.target_mm for s in tr])
+    C = np.stack([volume_center_mm(s).numpy() for s in tr])
+    T = A - C                                  # the frame the model predicts in
     mean = T.mean(axis=0)
     print(f"prior-only over {len(tr)} train / {len(te)} {args.split} series")
-    print(f"  training-set mean target: {[round(float(x), 1) for x in mean]} mm")
-    print(f"  target SD per axis:       {[round(float(x), 1) for x in T.std(axis=0)]} mm")
+    print(f"  absolute-frame target SD: {[round(float(x), 1) for x in A.std(axis=0)]} mm"
+          f"   <- includes the scanner table offset")
+    print(f"  volume-relative target SD:{[round(float(x), 1) for x in T.std(axis=0)]} mm"
+          f"   <- what is actually predictable")
+    print(f"  mean relative target:     {[round(float(x), 1) for x in mean]} mm")
     print("  (a large SD on one axis makes error elongated there for ANY constant\n"
           "   predictor, which shows up as R and alignment without any geometry)\n")
 
@@ -887,7 +911,8 @@ def cmd_baseline(args) -> int:
     for cname, vi in (("1view-pa", 0), ("1view-lat", 1), ("2view", 0)):
         if vi >= len(args.views):
             continue
-        errs = np.stack([mean - np.array(s.target_mm) for s in te])
+        errs = np.stack([(mean + volume_center_mm(s).numpy()) - np.array(s.target_mm)
+                         for s in te])
         rays = np.stack([np.array(s.target_mm) -
                          np.array(s.view_specs[vi]["source_mm"]) for s in te])
         results[cname] = anisotropy(errs, rays)
@@ -895,8 +920,9 @@ def cmd_baseline(args) -> int:
 
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "e1_prior.json"), "w") as f:
-        json.dump(dict(mean=list(map(float, mean)),
-                       target_sd=list(map(float, T.std(axis=0))),
+        json.dump(dict(mean_relative=list(map(float, mean)),
+                       target_sd_relative=list(map(float, T.std(axis=0))),
+                       target_sd_absolute=list(map(float, A.std(axis=0))),
                        results={k: dict(v) for k, v in results.items()}), f, indent=2)
     print(f"\n-> {os.path.join(args.out, 'e1_prior.json')}")
     print("\nRead any trained R against these. If a trained model's R and "

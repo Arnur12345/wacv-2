@@ -84,14 +84,23 @@ class WCache:
 
 def geometry_for_sample(slot_mm: torch.Tensor, views: Sequence,
                         cache: Optional[WCache] = None,
-                        key: Optional[str] = None):
-    """(w [M,P], null-space features [M,12]), from cache when available."""
+                        key: Optional[str] = None,
+                        center_mm: Optional[torch.Tensor] = None):
+    """
+    (w [M,P], conditioning features [M,15]), from cache when available.
+
+    Slot coordinates are expressed RELATIVE to the volume centre. In absolute
+    LPS the z of a slot swings by hundreds of millimetres between patients --
+    that is the scanner table offset, not anatomy -- so an absolute coordinate
+    feature is mostly a nuisance variable the model cannot predict from pixels.
+    """
     if cache is not None and key is not None:
         hit = cache.get(key)
         if hit is not None:
             return hit
     w = build_w_matrix(slot_mm, views)
-    f12 = conditioning_features(null_space_tensor(slot_mm, views, w), slot_mm)
+    rel = slot_mm if center_mm is None else (slot_mm - center_mm[None, :])
+    f12 = conditioning_features(null_space_tensor(slot_mm, views, w), rel)
     if cache is not None and key is not None:
         cache.put(key, w, f12)
     return w, f12
