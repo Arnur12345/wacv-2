@@ -45,7 +45,8 @@ import torch
 import torch.nn as nn
 
 from slots import (NEG_INF, Gather, NullSpaceEncoder, SlotGrid, build_log_w,
-                   build_w_matrix, null_space_features, null_space_tensor)
+                   build_w_matrix, conditioning_features, null_space_features,
+                   null_space_tensor)
 
 PATCH_EFFECTIVE = 28        # 14px vision patch x 2x2 merge
 
@@ -90,7 +91,7 @@ def geometry_for_sample(slot_mm: torch.Tensor, views: Sequence,
         if hit is not None:
             return hit
     w = build_w_matrix(slot_mm, views)
-    f12 = null_space_features(null_space_tensor(slot_mm, views, w))
+    f12 = conditioning_features(null_space_tensor(slot_mm, views, w), slot_mm)
     if cache is not None and key is not None:
         cache.put(key, w, f12)
     return w, f12

@@ -232,22 +232,51 @@ def null_space_features(N: torch.Tensor) -> torch.Tensor:
 
 
 class NullSpaceEncoder(nn.Module):
-    """Step 5: 12 numbers -> a small MLP -> added to the slot embedding."""
+    """
+    Step 5: the conditioning tensor -> a small MLP -> added to the slot.
+
+    The input is 12 null-space numbers PLUS the slot's own mm coordinate.
+
+    The coordinate is not decoration. Without it a slot knows what its evidence
+    cannot say (the eigen-structure) but not where it stands, so a model that
+    correctly finds the target at slot m still cannot name a position in
+    millimetres -- and the only strategy left is to emit the dataset mean, which
+    is exactly what the first run did.
+    """
+
+    N_FEATS = 15          # 3 eigenvalues + 9 eigenvector components + 3 mm
 
     def __init__(self, dim: int, hidden: int = 64):
         super().__init__()
-        self.mlp = nn.Sequential(nn.Linear(12, hidden), nn.GELU(),
+        self.mlp = nn.Sequential(nn.Linear(self.N_FEATS, hidden), nn.GELU(),
                                  nn.Linear(hidden, dim))
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
-    def forward(self, slots: torch.Tensor, feats12: torch.Tensor) -> torch.Tensor:
+    def forward(self, slots: torch.Tensor, feats: torch.Tensor) -> torch.Tensor:
         # geometry is computed on CPU in float64; follow the slots
-        f = feats12.to(device=slots.device, dtype=slots.dtype)
+        f = feats.to(device=slots.device, dtype=slots.dtype)
+        if f.shape[-1] != self.N_FEATS:
+            raise ValueError(f"expected {self.N_FEATS} conditioning features "
+                             f"(12 null-space + 3 mm), got {f.shape[-1]}")
         return slots + self.mlp(f)[None]
 
 
+def conditioning_features(N: torch.Tensor, slot_mm: torch.Tensor,
+                          scale_mm: float = 100.0) -> torch.Tensor:
+    """[M, 15]: the null-space 12, then the slot's position in units of 10cm."""
+    return torch.cat([null_space_features(N), slot_mm / scale_mm], dim=1)
+
+
 # --------------------------------------------------------------------------
+
+
+def _raises(fn) -> bool:
+    try:
+        fn()
+        return False
+    except Exception:
+        return True
 
 
 def selftest() -> int:
@@ -350,9 +379,18 @@ def selftest() -> int:
     t("eigenvector signs are canonical (deterministic features)",
       torch.allclose(null_space_features(N2.clone()), f12))
 
+    f15 = conditioning_features(N2, coords)
+    t("conditioning = 12 null-space + 3 mm position", f15.shape == (sg.n_slots, 15),
+      str(tuple(f15.shape)))
+    t("  the mm part is the slot's own coordinate",
+      torch.allclose(f15[:, 12:] * 100.0, coords))
+    t("  and two slots at different places differ there",
+      not torch.allclose(f15[0, 12:], f15[-1, 12:]))
     enc = NullSpaceEncoder(dim=64)
     t("encoder is zero-init: starts as a no-op",
-      torch.allclose(enc(slots, f12), slots))
+      torch.allclose(enc(slots, f15), slots))
+    t("  a 12-vector is refused rather than silently broadcast",
+      _raises(lambda: enc(slots, f12)))
 
     print("\n" + ("all self-tests passed" if ok else "SELF-TESTS FAILED"))
     return 0 if ok else 1
