@@ -855,12 +855,141 @@ def cmd_probe(args) -> int:
     return 0 if ok_all else 1
 
 
+
+def cmd_baseline(args) -> int:
+    """
+    Prior-only: predict the training-set mean target, ignoring the image.
+
+    This is not merely an error floor. It also produces an R and an alignment,
+    and those come purely from the anisotropy of the target distribution -- so
+    they say what R looks like when no geometry is being used at all. Any R
+    reported for a trained model has to be read against these, or the metric may
+    be describing where lung apices happen to sit rather than what the views
+    can resolve.
+    """
+    from e1_metric import anisotropy, compare
+
+    S = load_samples(args.data, args.landmark, args.views)
+    tr = [s for s in S if s.split == "train"]
+    te = [s for s in S if s.split == args.split]
+    if not tr or not te:
+        print("need both train and eval splits"); return 1
+
+    T = np.array([s.target_mm for s in tr])
+    mean = T.mean(axis=0)
+    print(f"prior-only over {len(tr)} train / {len(te)} {args.split} series")
+    print(f"  training-set mean target: {[round(float(x), 1) for x in mean]} mm")
+    print(f"  target SD per axis:       {[round(float(x), 1) for x in T.std(axis=0)]} mm")
+    print("  (a large SD on one axis makes error elongated there for ANY constant\n"
+          "   predictor, which shows up as R and alignment without any geometry)\n")
+
+    results = {}
+    for cname, vi in (("1view-pa", 0), ("1view-lat", 1), ("2view", 0)):
+        if vi >= len(args.views):
+            continue
+        errs = np.stack([mean - np.array(s.target_mm) for s in te])
+        rays = np.stack([np.array(s.target_mm) -
+                         np.array(s.view_specs[vi]["source_mm"]) for s in te])
+        results[cname] = anisotropy(errs, rays)
+    print(compare(results))
+
+    os.makedirs(args.out, exist_ok=True)
+    with open(os.path.join(args.out, "e1_prior.json"), "w") as f:
+        json.dump(dict(mean=list(map(float, mean)),
+                       target_sd=list(map(float, T.std(axis=0))),
+                       results={k: dict(v) for k, v in results.items()}), f, indent=2)
+    print(f"\n-> {os.path.join(args.out, 'e1_prior.json')}")
+    print("\nRead any trained R against these. If a trained model's R and "
+          "alignment\nmatch the prior's, the metric is describing the target "
+          "distribution.")
+    return 0
+
+
+
+@torch.no_grad()
+def cmd_overlay(args) -> int:
+    """
+    Draw the tokens `w` selects onto the DRR, and check view ordering.
+
+    Two separate claims are being tested, and only together do they mean `w`
+    reads the right image content:
+
+      (a) geometry -> (row, col) -> pixels lands on the target's projection;
+      (b) the tokens the tower returns are in that same order, and multiple
+          views are concatenated in the order `w` assumes.
+
+    Step 0 validated `w` against PIXELS. Nothing had validated it against TOKENS.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from PIL import Image
+
+    cfg = FOAConfig(slot_grid=tuple(args.slot_grid), slot_dim=args.slot_dim,
+                    n_heads=args.heads)
+    foa, processor = build_model(args.model, cfg, rank=args.rank)
+    dev, dt = next(foa.parameters()).device, next(foa.parameters()).dtype
+    rows, cols = foa.token_grid
+    n_per = rows * cols
+
+    S = [s for s in load_samples(args.data, args.landmark, args.views)
+         if s.split == "test"][:args.n]
+
+    # (b) view ordering: run [real DRR, blank] and check which half reacts
+    img0 = Image.open(S[0].images[0]).convert("RGB")
+    blank = Image.fromarray(np.zeros((img0.size[1], img0.size[0], 3), np.uint8))
+    enc = processor(text=["x"], images=[img0, blank], return_tensors="pt")
+    f = vision_features(foa.lm, enc["pixel_values"].to(dev, dt),
+                        enc["image_grid_thw"].to(dev)).float()
+    if f.shape[0] != 2 * n_per:
+        print(f"  view-order check skipped: {f.shape[0]} tokens for 2 views")
+    else:
+        v0 = float(f[:n_per].std()); v1 = float(f[n_per:].std())
+        okv = v0 > v1
+        print(f"  view order: first half std {v0:.3f} (real DRR), "
+              f"second half {v1:.3f} (blank) -> "
+              f"{'CORRECT' if okv else 'SWAPPED -- w attributes tokens to the wrong view'}")
+
+    # (a) do w's top tokens sit on the target's projection?
+    fig, axes = plt.subplots(len(S), 2, figsize=(9, 4.4 * len(S)), squeeze=False)
+    n_hit = 0
+    for r, s in enumerate(S):
+        views = rebuild_views(s, token_grid=foa.token_grid, patch_px=foa.patch_px)
+        tgt = torch.tensor(s.target_mm, dtype=torch.float64)
+        for c, view in enumerate(views):
+            sw = view.w(tgt)
+            u, v_, ok = view.project(tgt)
+            ax = axes[r][c]
+            ax.imshow(Image.open(s.images[c]).convert("L"), cmap="gray")
+            top = sw.top(args.k)
+            for j, (pid, wt) in enumerate(top):
+                x0, y0, x1, y1 = view.grid.patch_bbox_source(pid)
+                ax.add_patch(plt.Rectangle((x0, y0), x1 - x0, y1 - y0, ec="lime",
+                                           fc="none", lw=1.4, alpha=0.9))
+            ax.plot(float(u[0]) - 0.5, float(v_[0]) - 0.5, "r+", ms=14, mew=2)
+            if top:
+                x0, y0, x1, y1 = view.grid.patch_bbox_source(top[0][0])
+                hit = x0 <= float(u[0]) < x1 and y0 <= float(v_[0]) < y1
+                n_hit += hit
+                ax.set_title(f"{s.patient_id} {args.views[c]}  top-w patch "
+                             f"{'CONTAINS' if hit else 'MISSES'} the target",
+                             fontsize=8, color="green" if hit else "red")
+            ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle("green = patches w selects for the target; red + = its projection",
+                 fontsize=11)
+    fig.savefig(args.montage, dpi=110, bbox_inches="tight")
+    print(f"  top-w patch contains the projected target in "
+          f"{n_hit}/{len(S) * len(args.views)} panels")
+    print(f"-> {args.montage}   LOOK AT IT")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selftest")
-    for name in ("cache", "train", "eval", "probe"):
+    for name in ("cache", "train", "eval", "probe", "baseline", "overlay"):
         p = sub.add_parser(name)
         p.add_argument("--data", required=True)
         p.add_argument("--landmark", default="lung_apex_left")
@@ -884,6 +1013,14 @@ def main(argv=None) -> int:
         p.add_argument("--tau-end", type=float, default=1.0)
         if name == "probe":
             continue
+        if name == "overlay":
+            p.add_argument("--n", type=int, default=3)
+            p.add_argument("--k", type=int, default=6)
+            p.add_argument("--montage", default="w_overlay.png")
+            continue
+        if name == "baseline":
+            p.add_argument("--split", default="test")
+            continue
         if name == "train":
             p.add_argument("--epochs", type=int, default=4)
             p.add_argument("--lr", type=float, default=2e-4)
@@ -897,7 +1034,8 @@ def main(argv=None) -> int:
             p.add_argument("--split", default="test")
     args = ap.parse_args(argv)
     return {"selftest": lambda a: selftest(), "cache": cmd_cache,
-            "train": cmd_train, "eval": cmd_eval, "probe": cmd_probe}[args.cmd](args)
+            "train": cmd_train, "eval": cmd_eval, "probe": cmd_probe,
+            "baseline": cmd_baseline, "overlay": cmd_overlay}[args.cmd](args)
 
 
 if __name__ == "__main__":
