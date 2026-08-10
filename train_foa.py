@@ -692,6 +692,14 @@ def cmd_eval(args) -> int:
                                                     "nullspace."))]
         print(f"  loaded FOA head: {len(head_keys)} tensors, "
               f"{len([m for m in missing if not m.startswith('lm.')])} missing")
+        if args.force_gate is not None:
+            with torch.no_grad():
+                foa.gate.fill_(float(args.force_gate))
+            print(f"  gate FORCED to {args.force_gate}")
+            if float(args.force_gate) == 0.0:
+                print("    (the slot tokens are the LM's ONLY image access -- "
+                      "forcing 0 makes\n     the model blind, so the ceiling is "
+                      "the prior, not the 17.2mm baseline)")
         g = float(foa.gate)
         print(f"  gate = {g:.4f}"
               + ("   <-- STILL CLOSED: no image reaches the LM" if abs(g) < 1e-6 else ""))
@@ -1267,6 +1275,8 @@ def main(argv=None) -> int:
         else:
             p.add_argument("--adapter", default=None)
             p.add_argument("--split", default="test")
+            p.add_argument("--force-gate", type=float, default=None,
+                           help="override the learned gate; 0 blinds the model")
     args = ap.parse_args(argv)
     return {"selftest": lambda a: selftest(), "cache": cmd_cache,
             "train": cmd_train, "eval": cmd_eval, "probe": cmd_probe,
