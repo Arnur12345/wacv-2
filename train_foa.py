@@ -761,7 +761,7 @@ def cmd_eval(args) -> int:
     print("\n" + compare({k: v for k, v in results.items() if not k.startswith("_")}))
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "e1.json"), "w") as f:
-        json.dump(dict(results={k: {kk: vv for kk, vv in v.items()}
+        json.dump(dict(results={k: (dict(v) if isinstance(v, dict) else v)
                                 for k, v in results.items()},
                        records=records, uniform_w=args.uniform_w), f, indent=2)
     print(f"\n-> {os.path.join(args.out, 'e1.json')}")
@@ -1017,12 +1017,84 @@ def cmd_overlay(args) -> int:
     return 0
 
 
+
+@torch.no_grad()
+def cmd_diag(args) -> int:
+    """
+    How much do the slot tokens actually depend on the image?
+
+    The gather is `norm(slots + out(ctx))`. The residual `slots` is identical
+    for every patient, so if the gathered context is small next to it, the slot
+    tokens are near-constant after LayerNorm and the LM sees the same thing for
+    everyone -- which is what a model that reproduces the prior looks like.
+
+    Reported: the spread of slot tokens ACROSS patients against their spread
+    ACROSS slots. If the first is a small fraction of the second, the image is
+    not reaching the language model.
+    """
+    cfg = FOAConfig(slot_grid=tuple(args.slot_grid), slot_dim=args.slot_dim,
+                    n_heads=args.heads)
+    foa, processor = build_model(args.model, cfg, rank=args.rank)
+    if args.adapter:
+        sd = torch.load(os.path.join(args.adapter, "foa.pt"), map_location="cpu")
+        foa.load_state_dict(sd, strict=False)
+        print(f"  loaded FOA head from {args.adapter}")
+    foa.eval()
+    cache = WCache(os.path.join(args.data, "wcache"))
+    S = [s for s in load_samples(args.data, args.landmark, args.views)
+         if s.split == "test"][:args.n]
+
+    toks, ctxs, res = [], [], []
+    for s in S:
+        b = encode_sample(foa, processor, s, foa.slots, cache, args, None, False)
+        dev, dt = next(foa.parameters()).device, next(foa.parameters()).dtype
+        log_w = build_log_w(b["w"], temperature=args.tau_end)[None].to(dev, dt)
+        f = b["f12"].to(dev, dt)
+        sl = foa.slots().unsqueeze(0)
+        if foa.nullspace is not None:
+            sl = foa.nullspace(sl, f)
+        g = foa.gather
+        wd = g.q.weight.dtype
+        p = b["feats"].to(wd)
+        B, M = sl.shape[0], sl.shape[1]
+        q = g.q(sl.to(wd)).view(B, M, g.n_heads, g.head_dim).transpose(1, 2)
+        k = g.k(p).view(B, p.shape[1], g.n_heads, g.head_dim).transpose(1, 2)
+        v = g.v(p).view(B, p.shape[1], g.n_heads, g.head_dim).transpose(1, 2)
+        lg = (q @ k.transpose(-2, -1)) / math.sqrt(g.head_dim)
+        lg = lg + log_w.to(lg.dtype)[:, None]
+        ctx = (lg.softmax(-1) @ v).transpose(1, 2).reshape(B, M, -1)
+        ctxs.append(float(g.out(ctx).norm()))
+        res.append(float(sl.to(wd).norm()))
+        toks.append(foa.slot_tokens(b["feats"], log_w, f)[0].float().cpu())
+
+    T = torch.stack(toks)                       # [N, M, D]
+    across_patients = float(T.std(dim=0).mean())
+    across_slots = float(T.mean(dim=0).std(dim=0).mean())
+    print(f"\n  {len(S)} patients")
+    print(f"  |out(ctx)| (image-dependent) : {np.mean(ctxs):8.3f}")
+    print(f"  |slots|    (patient-constant): {np.mean(res):8.3f}")
+    print(f"  ratio                        : {np.mean(ctxs)/max(np.mean(res),1e-9):8.4f}")
+    print(f"\n  slot-token spread ACROSS patients: {across_patients:.5f}")
+    print(f"  slot-token spread ACROSS slots   : {across_slots:.5f}")
+    r = across_patients / max(across_slots, 1e-9)
+    print(f"  ratio                            : {r:.4f}")
+    if r < 0.1:
+        print("\n  The slot tokens barely move between patients: the LM receives "
+              "almost\n  the same input for everyone, so it can only emit the "
+              "prior. The image\n  is not reaching it -- fix the gather before "
+              "anything else.")
+    else:
+        print("\n  Slot tokens do vary with the image; the bottleneck is "
+              "downstream.")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selftest")
-    for name in ("cache", "train", "eval", "probe", "baseline", "overlay"):
+    for name in ("cache", "train", "eval", "probe", "baseline", "overlay", "diag"):
         p = sub.add_parser(name)
         p.add_argument("--data", required=True)
         p.add_argument("--landmark", default="lung_apex_left")
@@ -1046,6 +1118,10 @@ def main(argv=None) -> int:
         p.add_argument("--tau-end", type=float, default=1.0)
         if name == "probe":
             continue
+        if name == "diag":
+            p.add_argument("--adapter", default=None)
+            p.add_argument("--n", type=int, default=8)
+            continue
         if name == "overlay":
             p.add_argument("--n", type=int, default=3)
             p.add_argument("--k", type=int, default=6)
@@ -1068,7 +1144,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     return {"selftest": lambda a: selftest(), "cache": cmd_cache,
             "train": cmd_train, "eval": cmd_eval, "probe": cmd_probe,
-            "baseline": cmd_baseline, "overlay": cmd_overlay}[args.cmd](args)
+            "baseline": cmd_baseline, "overlay": cmd_overlay,
+            "diag": cmd_diag}[args.cmd](args)
 
 
 if __name__ == "__main__":
