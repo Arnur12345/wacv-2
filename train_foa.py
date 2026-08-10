@@ -1256,13 +1256,13 @@ def cmd_slotprobe(args) -> int:
     print("  Isotropic noise of that size pulls R toward 1 and shrinks dR, so read "
           "dR\n  against it before concluding there is no geometry dependence.")
     errs = all_err.get("2view", np.zeros(0))
-    print(f"\n  mode={args.mode} uniform_w={args.uniform_w}  "
+    print(f"\n  mode={args.mode} uniform_w={args.uniform_w} "
+          f"zero_image={args.zero_image} grid={tuple(args.slot_grid)}  "
           f"2-view median {np.median(errs):.2f} mm")
-    print(f"  prior-only 34.74 mm | direct-image baseline 17.2 mm")
-    if np.median(errs) < 17.2:
-        print("  -> the slot representation carries the target; the LM pathway "
-              "was the problem")
-    elif np.median(errs) < 34.74:
+    # 17.2mm was a 2D in-plane detector error and is NOT comparable to a 3D
+    # error; the only valid bar here is the 3D prior.
+    print(f"  prior-only (3D) 34.74 mm")
+    if np.median(errs) < 34.74:
         print("  -> slots beat the prior but not the direct baseline: the "
               "representation is lossy")
     else:
@@ -1272,10 +1272,41 @@ def cmd_slotprobe(args) -> int:
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, f"slotprobe_{args.mode}.json"), "w") as f:
         json.dump(dict(mode=args.mode, uniform_w=args.uniform_w,
+                       zero_image=args.zero_image, slot_grid=list(args.slot_grid),
                        median_by_condition={k: float(np.median(v))
                                             for k, v in all_err.items()},
                        results={k: dict(v) for k, v in results.items()},
+                       # per-sample errors, in test order, so two runs can be
+                       # compared with a PAIRED bootstrap on the same patients
+                       patients=[x.patient_id for x in te],
+                       errors_by_condition={k: [float(x) for x in v]
+                                            for k, v in all_err.items()},
                        n=len(te)), f, indent=2)
+    return 0
+
+
+
+def cmd_compare(args) -> int:
+    """Paired bootstrap of the median difference between two slotprobe runs."""
+    a = json.load(open(args.a))
+    b = json.load(open(args.b))
+    if a["patients"] != b["patients"]:
+        print("the two runs do not cover the same patients; not paired"); return 1
+    rng = np.random.default_rng(0)
+    print(f"A = {args.a}\nB = {args.b}\n")
+    for cond in a["errors_by_condition"]:
+        if cond not in b["errors_by_condition"]:
+            continue
+        ea = np.array(a["errors_by_condition"][cond])
+        eb = np.array(b["errors_by_condition"][cond])
+        d = np.median(ea) - np.median(eb)
+        idx = rng.integers(0, len(ea), (4000, len(ea)))
+        boot = np.median(ea[idx], 1) - np.median(eb[idx], 1)
+        lo, hi = np.percentile(boot, [2.5, 97.5])
+        sig = "" if lo < 0 < hi else "  *"
+        print(f"  {cond:10} A {np.median(ea):6.2f} | B {np.median(eb):6.2f} | "
+              f"diff {d:+6.2f} mm  95% CI [{lo:+.2f}, {hi:+.2f}]{sig}")
+    print("\n  * = CI excludes zero. Paired on the same patients.")
     return 0
 
 
@@ -1284,12 +1315,15 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selftest")
+    pc = sub.add_parser("compare")
+    pc.add_argument("--a", required=True)
+    pc.add_argument("--b", required=True)
     for name in ("cache", "train", "eval", "probe", "baseline", "overlay", "diag", "slotprobe"):
         p = sub.add_parser(name)
         p.add_argument("--data", required=True)
         p.add_argument("--landmark", default="lung_apex_left")
         p.add_argument("--views", nargs="+", default=["PA", "LAT"])
-        p.add_argument("--slot-grid", nargs=3, type=int, default=[6, 6, 6])
+        p.add_argument("--slot-grid", nargs=3, type=int, default=[12, 12, 12])
         p.add_argument("--uniform-w", action="store_true",
                        help="the ablation: same cost, no geometry")
         if name == "cache":
@@ -1349,7 +1383,8 @@ def main(argv=None) -> int:
     return {"selftest": lambda a: selftest(), "cache": cmd_cache,
             "train": cmd_train, "eval": cmd_eval, "probe": cmd_probe,
             "baseline": cmd_baseline, "overlay": cmd_overlay,
-            "diag": cmd_diag, "slotprobe": cmd_slotprobe}[args.cmd](args)
+            "diag": cmd_diag, "slotprobe": cmd_slotprobe,
+            "compare": cmd_compare}[args.cmd](args)
 
 
 if __name__ == "__main__":
