@@ -397,7 +397,11 @@ def build_model(model_id: str, cfg: FOAConfig, rank: int = 16, dtype="bfloat16")
 
     lm_dim = base.get_input_embeddings().weight.shape[1]
     patch_dim, token_grid, patch_px = _probe_tower(base, processor, td)
-    foa = FOA(base, patch_dim=patch_dim, lm_dim=lm_dim, cfg=cfg)
+    emb_scale = float(base.get_input_embeddings().weight.std())
+    print(f"  LM embedding per-element std = {emb_scale:.5f} "
+          f"(slot tokens are matched to this)")
+    foa = FOA(base, patch_dim=patch_dim, lm_dim=lm_dim, cfg=cfg,
+              emb_scale=emb_scale)
     foa.token_grid, foa.patch_px = token_grid, patch_px
     foa.to("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  lm_dim={lm_dim} patch_dim={patch_dim} "
@@ -688,9 +692,9 @@ def cmd_eval(args) -> int:
                                                     "nullspace."))]
         print(f"  loaded FOA head: {len(head_keys)} tensors, "
               f"{len([m for m in missing if not m.startswith('lm.')])} missing")
-        pn = float(foa.project.weight.norm())
-        print(f"  |project.weight| = {pn:.4f}"
-              + ("   <-- STILL ZERO: the head never trained" if pn < 1e-6 else ""))
+        g = float(foa.gate)
+        print(f"  gate = {g:.4f}"
+              + ("   <-- STILL CLOSED: no image reaches the LM" if abs(g) < 1e-6 else ""))
     foa.eval()
     cache = WCache(os.path.join(args.data, "wcache"))
 
@@ -1074,6 +1078,11 @@ def cmd_diag(args) -> int:
     print(f"  |out(ctx)| (image-dependent) : {np.mean(ctxs):8.3f}")
     print(f"  |slots|    (patient-constant): {np.mean(res):8.3f}")
     print(f"  ratio                        : {np.mean(ctxs)/max(np.mean(res),1e-9):8.4f}")
+    emb = foa.lm.get_input_embeddings().weight
+    print(f"\n  LM embedding per-element std     : {float(emb.std()):.5f}")
+    print(f"  slot-token per-element std       : {float(T.std()):.5f}")
+    print(f"  ratio (want ~1, not <<1)         : "
+          f"{float(T.std())/max(float(emb.std()),1e-9):.4f}")
     print(f"\n  slot-token spread ACROSS patients: {across_patients:.5f}")
     print(f"  slot-token spread ACROSS slots   : {across_slots:.5f}")
     r = across_patients / max(across_slots, 1e-9)

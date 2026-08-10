@@ -163,7 +163,7 @@ class FOA(nn.Module):
     """
 
     def __init__(self, lm: nn.Module, patch_dim: int, lm_dim: int,
-                 cfg: FOAConfig = FOAConfig()):
+                 cfg: FOAConfig = FOAConfig(), emb_scale: float = 1.0):
         super().__init__()
         self.cfg = cfg
         self.lm = lm
@@ -171,9 +171,16 @@ class FOA(nn.Module):
         self.gather = Gather(cfg.slot_dim, patch_dim, cfg.n_heads)
         self.nullspace = NullSpaceEncoder(cfg.slot_dim) if cfg.use_nullspace else None
         self.project = nn.Linear(cfg.slot_dim, lm_dim)
-        # Zero-init: at step 0 no image information can reach the LM at all.
-        nn.init.zeros_(self.project.weight)
-        nn.init.zeros_(self.project.bias)
+        self.token_norm = nn.LayerNorm(lm_dim)
+        # A slot token has to arrive at the LM on the same scale as the text
+        # tokens beside it. Projecting freely produced tokens with ~1/5 the
+        # per-element spread of the embedding matrix, which the LM can simply
+        # ignore -- 216 near-zero vectors next to real text.
+        self.register_buffer("emb_scale", torch.tensor(float(emb_scale)))
+        # LayerScale-style gate instead of a zero-init projection: still an
+        # exact no-op at step 0, but the projection's features are ready to be
+        # used the moment the gate opens, rather than having to grow from zero.
+        self.gate = nn.Parameter(torch.zeros(1))
 
     # -- slot tokens ------------------------------------------------------
 
@@ -185,7 +192,8 @@ class FOA(nn.Module):
         if self.nullspace is not None and f12 is not None:
             s = self.nullspace(s, f12)
         s = self.gather(s, patches, log_w)
-        return self.project(s)
+        t = self.token_norm(self.project(s))
+        return t * self.gate * self.emb_scale
 
     def forward(self, prefix_ids: torch.Tensor, suffix_ids: torch.Tensor,
                 patches: torch.Tensor, log_w: torch.Tensor,
@@ -215,8 +223,9 @@ class FOA(nn.Module):
 
     def trainable(self):
         """Everything except the LM and the (externally frozen) vision tower."""
-        for m in (self.slots, self.gather, self.project):
+        for m in (self.slots, self.gather, self.project, self.token_norm):
             yield from m.parameters()
+        yield self.gate
         if self.nullspace is not None:
             yield from self.nullspace.parameters()
 
@@ -356,7 +365,7 @@ def selftest() -> int:
       float(foa.slot_tokens(img_a, log_w, f12).abs().max()) == 0.0)
 
     with torch.no_grad():
-        foa.project.weight.add_(torch.randn_like(foa.project.weight) * 0.1)
+        foa.gate.add_(0.5)
     out_c = foa(pre, suf, img_a, log_w, f12).logits
     out_d = foa(pre, suf, img_b, log_w, f12).logits
     t("after a weight change it does depend on the image",
@@ -364,12 +373,13 @@ def selftest() -> int:
       f"max diff {float((out_c - out_d).abs().max()):.2e}")
 
     print("\ngradients")
-    nn.init.zeros_(foa.project.weight); nn.init.zeros_(foa.project.bias)
+    with torch.no_grad():
+        foa.gate.zero_()
     labels = torch.randint(0, 64, (B, 4))
     loss = foa(pre, suf, img_a, log_w, f12, labels=labels).loss
     loss.backward()
-    gp = foa.project.weight.grad
-    t("the zero-init projection still receives gradient",
+    gp = foa.gate.grad
+    t("the closed gate still receives gradient",
       gp is not None and float(gp.abs().max()) > 0,
       f"max |grad| {float(gp.abs().max()):.2e}")
     gs = foa.slots.embedding.weight.grad
@@ -377,9 +387,9 @@ def selftest() -> int:
     # the slot pathway is necessarily dormant on step 0. This is a consequence
     # of zero-init, not a fault -- but it means freezing the projection at zero
     # would leave the slots untrainable forever, so both halves are asserted.
-    t("at step 0 the slot pathway is dormant (W^T = 0)",
+    t("at step 0 the slot pathway is dormant (gate = 0)",
       gs is None or float(gs.abs().max()) == 0.0)
-    opt = torch.optim.SGD(list(foa.trainable()), lr=1e-2)
+    opt = torch.optim.SGD(list(foa.trainable()), lr=1.0)
     opt.step(); opt.zero_grad(set_to_none=True)
     foa(pre, suf, img_a, log_w, f12, labels=labels).loss.backward()
     gs2 = foa.slots.embedding.weight.grad
