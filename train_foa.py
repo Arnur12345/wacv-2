@@ -915,6 +915,21 @@ def cmd_baseline(args) -> int:
     print(f"  volume-relative target SD:{[round(float(x), 1) for x in T.std(axis=0)]} mm"
           f"   <- what is actually predictable")
     print(f"  mean relative target:     {[round(float(x), 1) for x in mean]} mm")
+
+    # Slot spacing: if slots are the only spatial carrier, this quantises the
+    # representation, and no readout can be finer than it.
+    ext = np.stack([(lambda b: (b[1] - b[0]).numpy())(
+        volume_box_mm(s.affine, s.volume_size)) for s in tr])
+    med_ext = np.median(ext, axis=0)
+    grid = np.array(args.slot_grid, dtype=float)
+    spacing = med_ext / grid
+    print(f"\n  volume box (median):      {[round(float(x)) for x in med_ext]} mm")
+    print(f"  slot grid:                {tuple(args.slot_grid)} = "
+          f"{int(np.prod(grid))} slots")
+    print(f"  SLOT SPACING:             {[round(float(x)) for x in spacing]} mm"
+          f"   (mean {spacing.mean():.0f} mm)")
+    print(f"  -> a representation carried only by slot identity cannot resolve\n"
+          f"     finer than about half that: ~{spacing.mean()/2:.0f} mm")
     print("  (a large SD on one axis makes error elongated there for ANY constant\n"
           "   predictor, which shows up as R and alignment without any geometry)\n")
 
@@ -1098,12 +1113,107 @@ def cmd_diag(args) -> int:
     return 0
 
 
+
+def cmd_slotprobe(args) -> int:
+    """
+    Do the slot tokens contain the answer? Read them directly, no LM.
+
+    A tiny head scores each slot and predicts the target as a weighted sum of
+    slot positions:
+
+        anchor  pred = sum_m softmax(score_m) * anchor_m
+        offset  pred = sum_m softmax(score_m) * (anchor_m + delta_m)
+
+    `anchor` can do no better than the slot spacing allows, so the gap between
+    the two measures the quantisation cost directly. And if neither beats the
+    prior, the representation does not carry the target and the fault is
+    upstream -- in `w`, in the features, or in the gather -- not in the LM.
+    """
+    import torch.nn.functional as Fnn
+
+    torch.manual_seed(args.seed)
+    S = load_samples(args.data, args.landmark, args.views)
+    tr = [s for s in S if s.split == "train"][:args.limit or None]
+    te = [s for s in S if s.split == "test"]
+    print(f"slot probe: {len(tr)} train / {len(te)} test, mode={args.mode}")
+
+    cfg = FOAConfig(slot_grid=tuple(args.slot_grid), slot_dim=args.slot_dim,
+                    n_heads=args.heads)
+    foa, processor = build_model(args.model, cfg, rank=args.rank)
+    for p in foa.lm.parameters():
+        p.requires_grad_(False)                 # the LM plays no part here
+    dev = next(foa.parameters()).device
+    D = args.slot_dim
+    score = nn.Linear(D, 1).to(dev)
+    delta = nn.Linear(D, 3).to(dev)
+    nn.init.zeros_(delta.weight); nn.init.zeros_(delta.bias)
+    cache = WCache(os.path.join(args.data, "wcache"))
+
+    params = list(foa.slots.parameters()) + list(foa.gather.parameters()) + \
+        list(score.parameters()) + list(delta.parameters())
+    if foa.nullspace is not None:
+        params += list(foa.nullspace.parameters())
+    opt = torch.optim.AdamW(params, lr=args.lr)
+
+    def forward(s, train):
+        b = encode_sample(foa, processor, s, foa.slots, cache, args, None, False)
+        lw = build_log_w(b["w"], temperature=args.tau_end)[None].to(dev)
+        sl = foa.slots().unsqueeze(0)
+        if foa.nullspace is not None:
+            sl = foa.nullspace(sl, b["f12"].to(dev))
+        g = foa.gather(sl, b["feats"], lw)                       # [1, M, D]
+        anchor = (b["slot_mm"] - volume_center_mm(s)).to(dev, g.dtype)   # [M,3]
+        a = Fnn.softmax(score(g).squeeze(-1), dim=-1)            # [1, M]
+        pos = anchor if args.mode == "anchor" else anchor + delta(g)[0]
+        pred = (a[0, :, None] * pos).sum(0)
+        tgt = torch.tensor(np.array(s.target_mm), dtype=g.dtype, device=dev) - \
+            volume_center_mm(s).to(dev, g.dtype)
+        return pred, tgt
+
+    for ep in range(args.epochs):
+        random.shuffle(tr)
+        tot, n = 0.0, 0
+        for i, s in enumerate(tr):
+            pred, tgt = forward(s, True)
+            loss = Fnn.smooth_l1_loss(pred, tgt, beta=10.0)
+            (loss / args.grad_accum).backward()
+            tot += float(loss.detach()); n += 1
+            if (i + 1) % args.grad_accum == 0:
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                opt.step(); opt.zero_grad(set_to_none=True)
+        print(f"  epoch {ep}: train loss {tot/max(n,1):.3f}", flush=True)
+
+    errs = []
+    with torch.no_grad():
+        for s in te:
+            pred, tgt = forward(s, False)
+            errs.append(float((pred - tgt).norm()))
+    errs = np.array(errs)
+    print(f"\n  mode={args.mode}  median {np.median(errs):.2f} mm | "
+          f"mean {errs.mean():.2f} | p90 {np.percentile(errs,90):.2f}")
+    print(f"  prior-only is 34.74 mm; the direct-image baseline reached 17.2 mm")
+    if np.median(errs) < 17.2:
+        print("  -> the slot representation carries the target; the LM pathway "
+              "was the problem")
+    elif np.median(errs) < 34.74:
+        print("  -> slots beat the prior but not the direct baseline: the "
+              "representation is lossy")
+    else:
+        print("  -> slots do not beat the prior: the fault is upstream of the "
+              "LM (w, features, or the gather)")
+    os.makedirs(args.out, exist_ok=True)
+    with open(os.path.join(args.out, f"slotprobe_{args.mode}.json"), "w") as f:
+        json.dump(dict(mode=args.mode, median=float(np.median(errs)),
+                       mean=float(errs.mean()), n=len(errs)), f, indent=2)
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selftest")
-    for name in ("cache", "train", "eval", "probe", "baseline", "overlay", "diag"):
+    for name in ("cache", "train", "eval", "probe", "baseline", "overlay", "diag", "slotprobe"):
         p = sub.add_parser(name)
         p.add_argument("--data", required=True)
         p.add_argument("--landmark", default="lung_apex_left")
@@ -1126,6 +1236,13 @@ def main(argv=None) -> int:
         p.add_argument("--tau-start", type=float, default=4.0)
         p.add_argument("--tau-end", type=float, default=1.0)
         if name == "probe":
+            continue
+        if name == "slotprobe":
+            p.add_argument("--mode", choices=["anchor", "offset"], default="offset")
+            p.add_argument("--epochs", type=int, default=6)
+            p.add_argument("--lr", type=float, default=1e-3)
+            p.add_argument("--grad-accum", type=int, default=8)
+            p.add_argument("--seed", type=int, default=0)
             continue
         if name == "diag":
             p.add_argument("--adapter", default=None)
@@ -1154,7 +1271,7 @@ def main(argv=None) -> int:
     return {"selftest": lambda a: selftest(), "cache": cmd_cache,
             "train": cmd_train, "eval": cmd_eval, "probe": cmd_probe,
             "baseline": cmd_baseline, "overlay": cmd_overlay,
-            "diag": cmd_diag}[args.cmd](args)
+            "diag": cmd_diag, "slotprobe": cmd_slotprobe}[args.cmd](args)
 
 
 if __name__ == "__main__":
