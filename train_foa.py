@@ -701,8 +701,12 @@ def cmd_eval(args) -> int:
                       "forcing 0 makes\n     the model blind, so the ceiling is "
                       "the prior, not the 17.2mm baseline)")
         g = float(foa.gate)
-        print(f"  gate = {g:.4f}"
-              + ("   <-- STILL CLOSED: no image reaches the LM" if abs(g) < 1e-6 else ""))
+        note = ""
+        if abs(g) < 1e-6:
+            note = ("   (forced blind: this run is the ablation)"
+                    if args.force_gate is not None
+                    else "   <-- STILL CLOSED: the gate never opened during training")
+        print(f"  gate = {g:.4f}{note}")
     foa.eval()
     cache = WCache(os.path.join(args.data, "wcache"))
 
@@ -1122,6 +1126,10 @@ def cmd_diag(args) -> int:
 
 
 
+def patch_dim_of(foa) -> int:
+    return foa.gather.k.in_features
+
+
 def cmd_slotprobe(args) -> int:
     """
     Do the slot tokens contain the answer? Read them directly, no LM.
@@ -1155,16 +1163,35 @@ def cmd_slotprobe(args) -> int:
     score = nn.Linear(D, 1).to(dev)
     delta = nn.Linear(D, 3).to(dev)
     nn.init.zeros_(delta.weight); nn.init.zeros_(delta.bias)
+    # `pooled` is the missing cell of the 2x2: the same regression objective on
+    # raw patch features, with no slots and no w. Without it, 37.7 -> 22.5 could
+    # be entirely the objective (coordinate regression vs emitting exact decimal
+    # digits from ~700 examples) rather than anything about the LM.
+    pooled_head = nn.Sequential(nn.Linear(2 * patch_dim_of(foa), 256), nn.GELU(),
+                                nn.Linear(256, 3)).to(dev)
     cache = WCache(os.path.join(args.data, "wcache"))
 
     params = list(foa.slots.parameters()) + list(foa.gather.parameters()) + \
-        list(score.parameters()) + list(delta.parameters())
+        list(score.parameters()) + list(delta.parameters()) + \
+        list(pooled_head.parameters())
     if foa.nullspace is not None:
         params += list(foa.nullspace.parameters())
     opt = torch.optim.AdamW(params, lr=args.lr)
 
-    def forward(s, train):
-        b = encode_sample(foa, processor, s, foa.slots, cache, args, None, False)
+    def forward(s, view_idx=None):
+        b = encode_sample(foa, processor, s, foa.slots, cache, args, view_idx, False)
+        tgt = torch.tensor(np.array(s.target_mm), dtype=torch.float32, device=dev) - \
+            volume_center_mm(s).to(dev, torch.float32)
+        if args.zero_image:
+            # slots then carry geometry and the conditioning tensor only. 22.5mm
+            # is 1.54x the prior -- not so far above it that "a smarter
+            # conditional prior" is excluded, and --uniform-w cannot test this
+            # because uniform w still carries image content.
+            b["feats"] = torch.zeros_like(b["feats"])
+        if args.mode == "pooled":
+            f = b["feats"].float()
+            p = torch.cat([f.mean(1), f.amax(1)], dim=-1)
+            return pooled_head(p)[0], tgt
         lw = build_log_w(b["w"], temperature=args.tau_end)[None].to(dev)
         sl = foa.slots().unsqueeze(0)
         if foa.nullspace is not None:
@@ -1174,15 +1201,19 @@ def cmd_slotprobe(args) -> int:
         a = Fnn.softmax(score(g).squeeze(-1), dim=-1)            # [1, M]
         pos = anchor if args.mode == "anchor" else anchor + delta(g)[0]
         pred = (a[0, :, None] * pos).sum(0)
-        tgt = torch.tensor(np.array(s.target_mm), dtype=g.dtype, device=dev) - \
-            volume_center_mm(s).to(dev, g.dtype)
-        return pred, tgt
+        return pred.float(), tgt
 
     for ep in range(args.epochs):
         random.shuffle(tr)
         tot, n = 0.0, 0
         for i, s in enumerate(tr):
-            pred, tgt = forward(s, True)
+            # Vary the view set exactly as the LM path does, so a one-view
+            # evaluation is in-distribution and dR measures the geometry rather
+            # than a distribution shift.
+            nv = len(args.views)
+            idx = (list(range(nv)) if random.random() > args.view_dropout
+                   else [random.randrange(nv)])
+            pred, tgt = forward(s, idx)
             loss = Fnn.smooth_l1_loss(pred, tgt, beta=10.0)
             (loss / args.grad_accum).backward()
             tot += float(loss.detach()); n += 1
@@ -1191,15 +1222,43 @@ def cmd_slotprobe(args) -> int:
                 opt.step(); opt.zero_grad(set_to_none=True)
         print(f"  epoch {ep}: train loss {tot/max(n,1):.3f}", flush=True)
 
-    errs = []
+    from e1_metric import anisotropy, compare
+
+    conditions = {"1view-pa": [0], "1view-lat": [1],
+                  "2view": list(range(len(args.views)))}
+    results, all_err = {}, {}
     with torch.no_grad():
-        for s in te:
-            pred, tgt = forward(s, False)
-            errs.append(float((pred - tgt).norm()))
-    errs = np.array(errs)
-    print(f"\n  mode={args.mode}  median {np.median(errs):.2f} mm | "
-          f"mean {errs.mean():.2f} | p90 {np.percentile(errs,90):.2f}")
-    print(f"  prior-only is 34.74 mm; the direct-image baseline reached 17.2 mm")
+        for cname, idx in conditions.items():
+            if max(idx) >= len(args.views):
+                continue
+            E, RY = [], []
+            for s in te:
+                pred, tgt = forward(s, idx)
+                e = (pred - tgt).float().cpu().numpy()
+                src = np.array(s.view_specs[idx[0]]["source_mm"])
+                E.append(e); RY.append(np.array(s.target_mm) - src)
+            E = np.stack(E)
+            results[cname] = anisotropy(E, np.stack(RY))
+            all_err[cname] = np.linalg.norm(E, axis=1)
+            print(f"  {cname}: median {np.median(all_err[cname]):.2f} mm", flush=True)
+
+    if "1view-pa" in results and "2view" in results:
+        dR = results["1view-pa"]["R"] - results["2view"]["R"]
+        print(f"\n  dR = R(1view-pa) - R(2view) = {dR:+.3f}"
+              f"   [registered: > 0; prior-only gives exactly 0]")
+    ext = np.median(np.stack([(lambda b: (b[1] - b[0]).numpy())(
+        volume_box_mm(x.affine, x.volume_size)) for x in te]), axis=0)
+    sp = ext / np.array(args.slot_grid, dtype=float)
+    quant = float(np.linalg.norm(sp / math.sqrt(12)))
+    print("\n" + compare(results))
+    print(f"\n  slot spacing {[round(float(x)) for x in sp]} mm -> cell-assignment "
+          f"noise ~{quant:.1f} mm in 3D (s/sqrt(12) per axis).")
+    print("  Isotropic noise of that size pulls R toward 1 and shrinks dR, so read "
+          "dR\n  against it before concluding there is no geometry dependence.")
+    errs = all_err.get("2view", np.zeros(0))
+    print(f"\n  mode={args.mode} uniform_w={args.uniform_w}  "
+          f"2-view median {np.median(errs):.2f} mm")
+    print(f"  prior-only 34.74 mm | direct-image baseline 17.2 mm")
     if np.median(errs) < 17.2:
         print("  -> the slot representation carries the target; the LM pathway "
               "was the problem")
@@ -1209,10 +1268,14 @@ def cmd_slotprobe(args) -> int:
     else:
         print("  -> slots do not beat the prior: the fault is upstream of the "
               "LM (w, features, or the gather)")
+
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, f"slotprobe_{args.mode}.json"), "w") as f:
-        json.dump(dict(mode=args.mode, median=float(np.median(errs)),
-                       mean=float(errs.mean()), n=len(errs)), f, indent=2)
+        json.dump(dict(mode=args.mode, uniform_w=args.uniform_w,
+                       median_by_condition={k: float(np.median(v))
+                                            for k, v in all_err.items()},
+                       results={k: dict(v) for k, v in results.items()},
+                       n=len(te)), f, indent=2)
     return 0
 
 
@@ -1246,11 +1309,16 @@ def main(argv=None) -> int:
         if name == "probe":
             continue
         if name == "slotprobe":
-            p.add_argument("--mode", choices=["anchor", "offset"], default="offset")
+            p.add_argument("--mode", choices=["anchor", "offset", "pooled"],
+                           default="offset",
+                           help="pooled = raw patch features, no slots, no w")
+            p.add_argument("--zero-image", action="store_true",
+                           help="slots carry geometry only; tests conditional prior")
             p.add_argument("--epochs", type=int, default=6)
             p.add_argument("--lr", type=float, default=1e-3)
             p.add_argument("--grad-accum", type=int, default=8)
             p.add_argument("--seed", type=int, default=0)
+            p.add_argument("--view-dropout", type=float, default=0.4)
             continue
         if name == "diag":
             p.add_argument("--adapter", default=None)
