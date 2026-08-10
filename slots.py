@@ -182,13 +182,21 @@ class Gather(nn.Module):
 def null_space_tensor(slot_mm: torch.Tensor, views: Sequence,
                       w: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
-    Per slot, N = sum_v w_v d_v d_v^T over the ray directions that image it.
+    Per slot, N = sum_v w_v (I - d_v d_v^T): the FISHER INFORMATION of the rays
+    that image it, not the outer product of the rays themselves.
 
-    N is rank 1 for a single view: its dominant eigenvector is the ray, and the
-    two small eigenvalues span the plane the view does constrain. Two
-    orthogonal views make it rank 2. The eigenvalues therefore say how many
-    independent directions of evidence this slot has, and the eigenvectors say
-    which -- which is precisely the geometric fact E1 measures.
+    A projection constrains the two directions PERPENDICULAR to its ray and
+    says nothing about depth along it, so its information is (I - dd^T), which
+    is rank 2 with a zero eigenvalue along the ray.
+
+    Using sum(w dd^T) instead inverts the meaning: it is rank 1 with its
+    LARGEST eigenvalue along the ray, so a descending sort hands the MLP the
+    least-observed direction first and labels the two well-observed directions
+    with zeros. It also makes 1/lambda_min meaningless, which is what the CRB
+    regression in E1 rests on.
+
+      one view          eigenvalues (1, 1, 0), lambda_min along the ray
+      two orthogonal    eigenvalues (2, 1, 1), lambda_min lifted off zero
 
     Returns [M, 3, 3].
     """
@@ -204,7 +212,8 @@ def null_space_tensor(slot_mm: torch.Tensor, views: Sequence,
         off += n_p
         d = slot_mm - view.source_mm[None, :]
         d = d / d.norm(dim=1, keepdim=True).clamp_min(1e-12)
-        N += wv[:, None, None] * (d[:, :, None] @ d[:, None, :])
+        I = torch.eye(3, dtype=torch.float64).expand(M, 3, 3)
+        N += wv[:, None, None] * (I - d[:, :, None] @ d[:, None, :])
     return N
 
 
@@ -350,26 +359,34 @@ def selftest() -> int:
 
     print("\nStep 5 -- the null-space tensor")
     N1 = null_space_tensor(coords, [pa])
-    e1 = torch.linalg.eigvalsh(N1)
-    t("one view -> rank 1 (two eigenvalues ~ 0)",
-      float(e1[:, :2].abs().max()) < 1e-9 and float(e1[:, 2].min()) > 0.9,
+    e1 = torch.linalg.eigvalsh(N1)          # ascending
+    t("one view -> rank 2, with lambda_min = 0 (depth unobserved)",
+      float(e1[:, 0].abs().max()) < 1e-9 and float(e1[:, 1].min()) > 0.9,
       f"eigenvalues ~ {[round(float(x), 3) for x in e1[0]]}")
 
     d = (coords - pa.source_mm[None, :])
     d = d / d.norm(dim=1, keepdim=True)
     _, v1 = torch.linalg.eigh(N1)
-    dom = v1[:, :, 2]
-    t("  its dominant eigenvector is the ray",
-      float((dom * d).sum(1).abs().min()) > 0.999,
-      f"min |cos| {float((dom * d).sum(1).abs().min()):.6f}")
+    null_vec = v1[:, :, 0]                  # eigenvector of the SMALLEST
+    t("  the NULL eigenvector is the ray (not the dominant one)",
+      float((null_vec * d).sum(1).abs().min()) > 0.999,
+      f"min |cos| {float((null_vec * d).sum(1).abs().min()):.6f}")
 
     N2 = null_space_tensor(coords, [pa, lat])
     e2 = torch.linalg.eigvalsh(N2)
-    t("two orthogonal views -> rank 2",
-      float(e2[:, 0].abs().max()) < 1e-6 and float(e2[:, 1].min()) > 0.5,
-      f"eigenvalues ~ {[round(float(x), 3) for x in e2[0]]}")
-    t("  the unconstrained direction shrinks when a view is added",
-      float(e2[:, 0].mean()) <= float(e1[:, 0].mean()) + 1e-9)
+    # Slots that only ONE view can see keep lambda_min = 0, correctly: a second
+    # view lifts the null direction only where it actually contributes weight.
+    seen2 = (build_w_matrix(coords, [pa]).sum(1) > 0) & \
+            (build_w_matrix(coords, [lat]).sum(1) > 0)
+    t("two views lift lambda_min wherever both actually see the slot",
+      float(e2[seen2, 0].min()) > 0.5 and bool(seen2.any()),
+      f"{int(seen2.sum())}/{len(seen2)} slots seen by both; "
+      f"min lambda_min there {float(e2[seen2, 0].min()):.3f}")
+    t("  and slots only one view sees keep lambda_min = 0",
+      float(e2[~seen2, 0].abs().max()) < 1e-9 if bool((~seen2).any()) else True)
+    t("  adding a view raises lambda_min (the CRB quantity E1 uses)",
+      float(e2[:, 0].mean()) > float(e1[:, 0].mean()) + 0.5,
+      f"{float(e1[:, 0].mean()):.3f} -> {float(e2[:, 0].mean()):.3f}")
 
     f12 = null_space_features(N2)
     t("features are 12 numbers per slot", f12.shape == (sg.n_slots, 12),

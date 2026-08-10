@@ -74,12 +74,25 @@ class WCache:
         if not os.path.exists(p):
             return None
         z = np.load(p)
-        return torch.from_numpy(z["w"]), torch.from_numpy(z["f12"])
+        if "w" in z:                              # legacy dense entry
+            return torch.from_numpy(z["w"]), torch.from_numpy(z["f12"])
+        shape = tuple(int(x) for x in z["shape"])
+        w = torch.zeros(shape, dtype=torch.float32)
+        idx = torch.from_numpy(z["idx"].astype(np.int64))
+        w.view(-1)[idx] = torch.from_numpy(z["val"])
+        return w, torch.from_numpy(z["f12"])
 
     def put(self, key: str, w: torch.Tensor, f12: torch.Tensor):
+        # w is ~2% dense. Stored densely, a 12^3 grid over 1800 patches is
+        # ~12MB per entry and ~26GB across the dataset; sparse it is ~0.5MB.
+        wf = w.detach().cpu().to(torch.float32)
+        flat = wf.reshape(-1)
+        nz = torch.nonzero(flat, as_tuple=False).reshape(-1)
         np.savez_compressed(os.path.join(self.root, key + ".npz"),
-                            w=w.cpu().numpy().astype(np.float32),
-                            f12=f12.cpu().numpy().astype(np.float32))
+                            shape=np.array(wf.shape, np.int64),
+                            idx=nz.numpy().astype(np.int64),
+                            val=flat[nz].numpy(),
+                            f12=f12.detach().cpu().numpy().astype(np.float32))
 
 
 def geometry_for_sample(slot_mm: torch.Tensor, views: Sequence,
@@ -146,7 +159,7 @@ def effective_width(log_w: torch.Tensor) -> float:
 
 @dataclass
 class FOAConfig:
-    slot_grid: Tuple[int, int, int] = (6, 6, 6)
+    slot_grid: Tuple[int, int, int] = (12, 12, 12)
     slot_dim: int = 1024
     n_heads: int = 8
     temperature: float = 1.0
@@ -163,7 +176,8 @@ class FOA(nn.Module):
     """
 
     def __init__(self, lm: nn.Module, patch_dim: int, lm_dim: int,
-                 cfg: FOAConfig = FOAConfig(), emb_scale: float = 1.0):
+                 cfg: FOAConfig = FOAConfig(), emb_scale: float = 1.0,
+                 gate_init: float = 1.0):
         super().__init__()
         self.cfg = cfg
         self.lm = lm
@@ -177,10 +191,13 @@ class FOA(nn.Module):
         # per-element spread of the embedding matrix, which the LM can simply
         # ignore -- 216 near-zero vectors next to real text.
         self.register_buffer("emb_scale", torch.tensor(float(emb_scale)))
-        # LayerScale-style gate instead of a zero-init projection: still an
-        # exact no-op at step 0, but the projection's features are ready to be
-        # used the moment the gate opens, rather than having to grow from zero.
-        self.gate = nn.Parameter(torch.zeros(1))
+        # The gate multiplies the forward contribution AND every gradient
+        # flowing back into slots, gather, projection and the conditioning MLP.
+        # Initialised at zero it is a death spiral: the upstream pathway cannot
+        # learn, so it never becomes useful, so the gate never opens -- which is
+        # what "gate = -0.007 after 8 epochs" actually was. The identity-start
+        # property has been verified; it is not worth the experiment.
+        self.gate = nn.Parameter(torch.full((1,), float(gate_init)))
 
     # -- slot tokens ------------------------------------------------------
 
@@ -345,9 +362,9 @@ def selftest() -> int:
       widths[0] > widths[1] > widths[2],
       "  ".join(f"T={T}: {x:.1f} patches" for T, x in zip((4.0, 1.0, 0.25), widths)))
 
-    print("\nzero-init")
+    print("\nzero-init (gate_init=0 verified once; the default is now open)")
     lm = _StubLM(dim=32)
-    foa = FOA(lm, patch_dim=16, lm_dim=32, cfg=cfg)
+    foa = FOA(lm, patch_dim=16, lm_dim=32, cfg=cfg, gate_init=0.0)
     B, P = 1, 2 * n_per
     pre = torch.randint(0, 64, (B, 5))
     suf = torch.randint(0, 64, (B, 4))
